@@ -1,3 +1,4 @@
+import json
 import os
 
 import reclaude as cr
@@ -32,25 +33,31 @@ def _e(project, sid, ts, display=""):
     return {"project": project, "session_id": sid, "ts": ts, "display": display}
 
 
-def test_group_by_project_orders_and_aggregates():
+def test_group_by_home_attribution_and_order():
     entries = [
         _e("/p/a", "s1", 1000, "first"),
-        _e("/p/a", "s1", 5000, "latest in s1"),
-        _e("/p/a", "s2", 3000, "only in s2"),
-        _e("/p/b", "s3", 9000, "newest dir"),
+        _e("/p/b", "s1", 5000, "moved"),   # session moved dirs: home stays /p/a
+        _e("/p/a", "s2", 3000, "second"),
+        _e("/p/c", "s3", 9000, "newest"),
     ]
-    groups = cr.group_by_project(entries, dir_exists=lambda p: True)
-    assert [g["path"] for g in groups] == ["/p/b", "/p/a"]  # newest first
+    groups = cr.group_by_home(entries, transcript_exists=lambda h, s: True)
+    assert [g["path"] for g in groups] == ["/p/c", "/p/a"]
     a = groups[1]
     assert a["last_ts"] == 5000
-    assert [s["session_id"] for s in a["sessions"]] == ["s1", "s2"]  # newest first
-    assert a["sessions"][0] == {"session_id": "s1", "ts": 5000, "display": "latest in s1"}
+    assert [s["session_id"] for s in a["sessions"]] == ["s1", "s2"]
+    assert a["sessions"][0]["display"] == "moved"
 
 
-def test_group_by_project_drops_missing_dirs():
-    entries = [_e("/gone", "s1", 1000), _e("/here", "s2", 2000)]
-    groups = cr.group_by_project(entries, dir_exists=lambda p: p == "/here")
-    assert [g["path"] for g in groups] == ["/here"]
+def test_group_by_home_drops_sessions_without_transcript():
+    entries = [_e("/p/a", "s1", 1000), _e("/p/a", "s2", 2000), _e("/p/b", "s3", 3000)]
+    groups = cr.group_by_home(entries, transcript_exists=lambda h, sid: sid != "s2")
+    assert [g["path"] for g in groups] == ["/p/b", "/p/a"]
+    assert [s["session_id"] for s in groups[1]["sessions"]] == ["s1"]
+
+
+def test_group_by_home_drops_empty_groups():
+    entries = [_e("/p/a", "s1", 1000)]
+    assert cr.group_by_home(entries, transcript_exists=lambda h, s: False) == []
 
 
 def _fake_proc(tmp_path, pid, comm, cwd_target):
@@ -103,3 +110,131 @@ def test_truncate():
     assert cr.truncate("hello", 10) == "hello"
     assert cr.truncate("hello world", 8) == "hello w…"
     assert cr.truncate("hi", 0) == ""
+
+
+def test_mung_path():
+    assert cr.mung_path("/home/u/scratch") == "-home-u-scratch"
+    assert cr.mung_path("/home/u/repo/.claude/worktrees/a1") == \
+        "-home-u-repo--claude-worktrees-a1"
+
+
+def test_transcript_path():
+    p = cr.transcript_path("/home/u/scratch", "abc", projects_dir="/pp")
+    assert p == "/pp/-home-u-scratch/abc.jsonl"
+
+
+def test_transcript_exists(tmp_path):
+    d = tmp_path / "-home-u-x"
+    d.mkdir()
+    (d / "s1.jsonl").write_text("{}")
+    assert cr.transcript_exists("/home/u/x", "s1", projects_dir=str(tmp_path))
+    assert not cr.transcript_exists("/home/u/x", "s2", projects_dir=str(tmp_path))
+
+
+def test_classify_dir():
+    assert cr.classify_dir("/x", isdir=lambda p: True) == ("live", None, None)
+    assert cr.classify_dir("/r/.claude/worktrees/a1", isdir=lambda p: p == "/r") == \
+        ("orphan-worktree", "/r", "a1")
+    assert cr.classify_dir("/gone/dir", isdir=lambda p: False) == ("gone", None, None)
+
+
+def test_classify_dir_worktree_repo_also_gone():
+    assert cr.classify_dir("/r/.claude/worktrees/a1", isdir=lambda p: False) == \
+        ("gone", None, None)
+
+
+def _fake_session_file(dirpath, pid, sid, cwd):
+    (dirpath / f"{pid}.json").write_text(
+        json.dumps({"pid": pid, "sessionId": sid, "cwd": str(cwd)}))
+
+
+def test_live_sessions(tmp_path):
+    sdir = tmp_path / "sessions"
+    sdir.mkdir()
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    _fake_session_file(sdir, 100, "s-live", work)          # live claude
+    p = proc / "100"
+    p.mkdir()
+    (p / "comm").write_text("claude\n")
+    _fake_session_file(sdir, 200, "s-stale", work)         # pid not running
+    _fake_session_file(sdir, 300, "s-vim", work)           # pid alive, not claude
+    p = proc / "300"
+    p.mkdir()
+    (p / "comm").write_text("vim\n")
+    (sdir / "400.json").write_text("not json")             # malformed
+    busy, running = cr.live_sessions(sessions_dir=str(sdir), proc_root=str(proc))
+    assert busy == {os.path.realpath(str(work))}
+    assert running == {"s-live"}
+
+
+def test_live_sessions_fallback_to_proc_scan(tmp_path):
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    p = proc / "500"
+    p.mkdir()
+    (p / "comm").write_text("claude\n")
+    (p / "cwd").symlink_to(work)
+    busy, running = cr.live_sessions(sessions_dir=str(tmp_path / "missing"),
+                                     proc_root=str(proc))
+    assert busy == {os.path.realpath(str(work))}
+    assert running == set()
+
+
+def _g(path, sessions):
+    return {"path": path, "last_ts": sessions[0]["ts"], "sessions": sessions}
+
+
+def _s(sid, ts, display=""):
+    return {"session_id": sid, "ts": ts, "display": display}
+
+
+def test_flatten_rows_expansion_filter_running():
+    g1 = _g("/p/a", [_s("s1", 2000, "x"), _s("s2", 1000, "y")])
+    g2 = _g("/p/b", [_s("s3", 500, "z")])
+    rows = cr.flatten_rows([g1, g2], expanded={"/p/a"}, filt="", home="/h",
+                           busy=set(), running_ids={"s2"}, isdir=lambda p: True)
+    assert [(r["kind"], r.get("session", {}).get("session_id")) for r in rows] == [
+        ("dir", None), ("session", "s1"), ("session", "s2"), ("dir", None)]
+    assert rows[2]["running"] is True and rows[1]["running"] is False
+    rows = cr.flatten_rows([g1, g2], expanded={"/p/a"}, filt="B", home="/h",
+                           busy=set(), running_ids=set(), isdir=lambda p: True)
+    assert len(rows) == 1 and rows[0]["group"] is g2
+
+
+def test_flatten_rows_busy_and_classification():
+    g = _g("/r/.claude/worktrees/a1", [_s("s1", 100)])
+    rows = cr.flatten_rows([g], expanded={"/r/.claude/worktrees/a1"}, filt="",
+                           home="/h", busy={"/r/.claude/worktrees/a1"},
+                           running_ids=set(), isdir=lambda p: p == "/r")
+    assert rows[0]["cls"] == "orphan-worktree"
+    assert (rows[0]["repo"], rows[0]["name"]) == ("/r", "a1")
+    assert rows[0]["busy"] is True and rows[1]["busy"] is True
+
+
+def test_row_spans_dir():
+    g = _g("/h/proj", [_s("s1", 0, "hello")])
+    row = {"kind": "dir", "group": g, "cls": "live",
+           "repo": None, "name": None, "busy": True}
+    assert cr._row_spans(row, now_ms=60_000, home="/h") == [
+        ("  1m  ", "time"), ("~/proj", "path"),
+        (" [running]", "running"), ("  —  hello", "text")]
+
+
+def test_row_spans_badges_and_session():
+    g = _g("/r/.claude/worktrees/a1", [_s("s1", 0, "")])
+    row = {"kind": "dir", "group": g, "cls": "orphan-worktree",
+           "repo": "/r", "name": "a1", "busy": False}
+    assert (" [worktree gone]", "orphan") in cr._row_spans(row, 0, "/h")
+    row["cls"] = "gone"
+    assert (" [gone]", "gone") in cr._row_spans(row, 0, "/h")
+    srow = {"kind": "session", "group": g, "session": _s("s1", 0, ""),
+            "cls": "live", "repo": None, "name": None, "busy": False,
+            "running": True}
+    assert cr._row_spans(srow, 0, "/h") == [
+        ("    ", "text"), ("  0s  ", "time"),
+        ("(no prompt)", "text"), (" [running]", "running")]
