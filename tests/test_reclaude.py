@@ -217,17 +217,18 @@ def test_flatten_rows_busy_and_classification():
 
 
 def test_row_spans_dir():
-    g = _g("/h/proj", [_s("s1", 0, "hello")])
-    row = {"kind": "dir", "group": g, "cls": "live",
-           "repo": None, "name": None, "busy": True}
-    assert cr._row_spans(row, now_ms=60_000, home="/h") == [
-        ("  1m  ", "time"), ("~/proj", "path"),
-        (" [running]", "running"), ("  —  hello", "text")]
+    g = _g("/h/proj", [_s("s1", 60_000, "newest"), _s("s0", 0, "older")])
+    row = {"kind": "dir", "group": g, "vis_sessions": g["sessions"][1:],
+           "cls": "live", "repo": None, "name": None, "busy": True}
+    # time and prompt come from the newest VISIBLE session (s0), not s1
+    assert cr._row_spans(row, now_ms=120_000, home="/h") == [
+        ("  2m  ", "time"), ("~/proj", "path"),
+        (" [running]", "running"), ("  —  older", "text")]
 
 
 def test_row_spans_badges_and_session():
     g = _g("/r/.claude/worktrees/a1", [_s("s1", 0, "")])
-    row = {"kind": "dir", "group": g, "cls": "orphan-worktree",
+    row = {"kind": "dir", "group": g, "vis_sessions": g["sessions"], "cls": "orphan-worktree",
            "repo": "/r", "name": "a1", "busy": False}
     assert (" [worktree gone]", "orphan") in cr._row_spans(row, 0, "/h")
     row["cls"] = "gone"
@@ -263,3 +264,37 @@ def test_flatten_rows_filters_apply_before_cap():
                            home="/h", busy=set(), running_ids=set(),
                            isdir=lambda p: p == "/p/old", show_missing=False)
     assert len(rows) == 1 and rows[0]["group"] is live_old
+
+
+def test_flatten_rows_prompt_text_match():
+    g1 = _g("/p/a", [_s("s1", 2000, "fix the parser"), _s("s2", 1000, "other")])
+    g2 = _g("/p/b", [_s("s3", 500, "unrelated")])
+    rows = cr.flatten_rows([g1, g2], expanded={"/p/a", "/p/b"}, filt="PARSER",
+                           home="/h", busy=set(), running_ids=set(),
+                           isdir=lambda p: True)
+    # dir surfaces on prompt match though its path doesn't match the filter;
+    # only the matching session renders; g2 is fully hidden
+    assert [(r["kind"], r.get("session", {}).get("session_id")) for r in rows] == [
+        ("dir", None), ("session", "s1")]
+    assert rows[0]["vis_sessions"] == [g1["sessions"][0]]
+
+
+def test_flatten_rows_age_filters_sessions_and_dir():
+    g = _g("/p/a", [_s("new", 5000, "recent"), _s("mid", 3000, "middle"),
+                    _s("old", 1000, "ancient")])
+    rows = cr.flatten_rows([g], expanded={"/p/a"}, filt="", home="/h",
+                           busy=set(), running_ids=set(), isdir=lambda p: True,
+                           min_ts=3000)
+    assert [r.get("session", {}).get("session_id") for r in rows] == [
+        None, "new", "mid"]                       # "old" hidden; boundary kept
+    assert rows[0]["vis_sessions"][0]["session_id"] == "new"
+    assert cr.flatten_rows([g], expanded=set(), filt="", home="/h",
+                           busy=set(), running_ids=set(), isdir=lambda p: True,
+                           min_ts=6000) == []     # no survivor -> dir hidden
+
+
+def test_flatten_rows_dir_top_reflects_filter():
+    g = _g("/p/a", [_s("s1", 2000, "alpha"), _s("s2", 1000, "beta")])
+    rows = cr.flatten_rows([g], expanded=set(), filt="beta", home="/h",
+                           busy=set(), running_ids=set(), isdir=lambda p: True)
+    assert rows[0]["vis_sessions"][0]["session_id"] == "s2"

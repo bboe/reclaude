@@ -209,30 +209,36 @@ def flatten_rows(groups, expanded, filt, home, busy, running_ids,
                  isdir=os.path.isdir, show_missing=True, min_ts=None):
     """Flatten groups + expansion state into the visible row list.
 
-    Dir row:     {"kind": "dir", "group", "cls", "repo", "name", "busy"}
-    Session row: same fields plus {"kind": "session", "session", "running"}.
-    Dirs pass a case-insensitive substring filter on the abbreviated path,
-    a missing-dir filter (show_missing=False hides non-live dirs), and an
-    age cutoff (min_ts vs last_ts), then are capped at MAX_DIRS; expanded
-    dirs contribute their session rows (sessions are never age-filtered).
+    Dir row:     {"kind": "dir", "group", "vis_sessions", "cls", "repo",
+                  "name", "busy"}
+    Session row: {"kind": "session", "group", "session", "cls", "repo",
+                  "name", "busy", "running"}.
+    A session is visible iff it passes the age window (min_ts) and the text
+    filter — a dir-path match admits all its sessions, otherwise the prompt
+    text must contain the filter (both case-insensitive). A dir is shown iff
+    it has visible sessions and passes the missing-dir filter; dirs are
+    capped at MAX_DIRS. Expanded dirs render only their visible sessions.
     """
+    f = filt.lower()
     kept = []
     for g in groups:
-        if filt.lower() not in abbreviate_path(g["path"], home).lower():
-            continue
-        if min_ts is not None and g["last_ts"] < min_ts:
+        path_match = f in abbreviate_path(g["path"], home).lower()
+        vis = [s for s in g["sessions"]
+               if (min_ts is None or s["ts"] >= min_ts)
+               and (path_match or f in s["display"].lower())]
+        if not vis:
             continue
         cls, repo, name = classify_dir(g["path"], isdir)
         if not show_missing and cls != "live":
             continue
-        kept.append((g, cls, repo, name))
+        kept.append((g, vis, cls, repo, name))
     rows = []
-    for g, cls, repo, name in kept[:MAX_DIRS]:
+    for g, vis, cls, repo, name in kept[:MAX_DIRS]:
         b = _is_busy(g["path"], busy)
-        rows.append({"kind": "dir", "group": g, "cls": cls,
-                     "repo": repo, "name": name, "busy": b})
+        rows.append({"kind": "dir", "group": g, "vis_sessions": vis,
+                     "cls": cls, "repo": repo, "name": name, "busy": b})
         if g["path"] in expanded:
-            for s in g["sessions"]:
+            for s in vis:
                 rows.append({"kind": "session", "group": g, "session": s,
                              "cls": cls, "repo": repo, "name": name, "busy": b,
                              "running": s["session_id"] in running_ids})
@@ -316,7 +322,9 @@ def _row_spans(row, now_ms, home):
     """
     if row["kind"] == "dir":
         g = row["group"]
-        spans = [(f"{relative_time(g['last_ts'], now_ms):>4}  ", "time"),
+        vis = row["vis_sessions"]
+        ts = vis[0]["ts"] if vis else g["last_ts"]
+        spans = [(f"{relative_time(ts, now_ms):>4}  ", "time"),
                  (abbreviate_path(g["path"], home), "path")]
         if row["busy"]:
             spans.append((" [running]", "running"))
@@ -324,7 +332,7 @@ def _row_spans(row, now_ms, home):
             spans.append((" [worktree gone]", "orphan"))
         elif row["cls"] == "gone":
             spans.append((" [gone]", "gone"))
-        last = g["sessions"][0]["display"] if g["sessions"] else ""
+        last = row["vis_sessions"][0]["display"] if row["vis_sessions"] else ""
         if last:
             spans.append((f"  —  {last}", "text"))
         return spans
@@ -403,7 +411,7 @@ def run_picker(stdscr, groups, busy, running_ids):
             elif r["kind"] == "session":
                 return _launch(r, r["session"]["session_id"])
             else:
-                return _launch(r, r["group"]["sessions"][0]["session_id"])
+                return _launch(r, r["vis_sessions"][0]["session_id"])
         elif key in (curses.KEY_RIGHT, ord("\t")) and n:
             if rows[sel]["kind"] == "dir":
                 expanded.add(rows[sel]["group"]["path"])
