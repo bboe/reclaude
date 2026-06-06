@@ -206,19 +206,28 @@ def _is_busy(path, busy):
 
 
 def flatten_rows(groups, expanded, filt, home, busy, running_ids,
-                 isdir=os.path.isdir):
+                 isdir=os.path.isdir, show_missing=True, min_ts=None):
     """Flatten groups + expansion state into the visible row list.
 
     Dir row:     {"kind": "dir", "group", "cls", "repo", "name", "busy"}
     Session row: same fields plus {"kind": "session", "session", "running"}.
-    Dirs are filtered by case-insensitive substring on the abbreviated path
-    and capped at MAX_DIRS; expanded dirs contribute their session rows.
+    Dirs pass a case-insensitive substring filter on the abbreviated path,
+    a missing-dir filter (show_missing=False hides non-live dirs), and an
+    age cutoff (min_ts vs last_ts), then are capped at MAX_DIRS; expanded
+    dirs contribute their session rows (sessions are never age-filtered).
     """
-    rows = []
-    filtered = [g for g in groups
-                if filt.lower() in abbreviate_path(g["path"], home).lower()]
-    for g in filtered[:MAX_DIRS]:
+    kept = []
+    for g in groups:
+        if filt.lower() not in abbreviate_path(g["path"], home).lower():
+            continue
+        if min_ts is not None and g["last_ts"] < min_ts:
+            continue
         cls, repo, name = classify_dir(g["path"], isdir)
+        if not show_missing and cls != "live":
+            continue
+        kept.append((g, cls, repo, name))
+    rows = []
+    for g, cls, repo, name in kept[:MAX_DIRS]:
         b = _is_busy(g["path"], busy)
         rows.append({"kind": "dir", "group": g, "cls": cls,
                      "repo": repo, "name": name, "busy": b})
@@ -328,7 +337,10 @@ def _row_spans(row, now_ms, home):
     return spans
 
 
-HELP = "↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · type to filter · q quit"
+AGE_WINDOWS = [("all", None), ("1mo", 30 * 86400_000), ("1w", 7 * 86400_000),
+               ("1d", 86400_000), ("1h", 3600_000)]
+HELP = ("↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
+        "^T age · type to filter · q quit")
 FLASH_BUSY = "that directory already has a claude session running"
 FLASH_GONE = "directory no longer exists"
 
@@ -350,11 +362,15 @@ def run_picker(stdscr, groups, busy, running_ids):
     home = os.path.expanduser("~")
 
     sel, top, filt, flash = 0, 0, "", ""
+    show_missing, age_idx = True, 0
     expanded = set()
 
     while True:
         now_ms = int(time.time() * 1000)
-        rows = flatten_rows(groups, expanded, filt, home, busy, running_ids)
+        label, window = AGE_WINDOWS[age_idx]
+        min_ts = now_ms - window if window is not None else None
+        rows = flatten_rows(groups, expanded, filt, home, busy, running_ids,
+                            show_missing=show_missing, min_ts=min_ts)
         render = [(_row_spans(r, now_ms, home),
                     curses.A_DIM if (r["busy"] or r["cls"] == "gone") else 0)
                   for r in rows]
@@ -366,8 +382,12 @@ def run_picker(stdscr, groups, busy, running_ids):
             footer, footer_attr = HELP, curses.A_DIM
         n = len(rows)
         sel = max(0, min(sel, n - 1)) if n else 0
-        top = _draw(stdscr, "reclaude — recent sessions", render,
-                    sel, top, footer, footer_attr, attrs)
+        title = "reclaude — recent sessions"
+        if window is not None:
+            title += f" · ≤{label}"
+        if not show_missing:
+            title += " · missing hidden"
+        top = _draw(stdscr, title, render, sel, top, footer, footer_attr, attrs)
 
         key = stdscr.getch()
         if key == curses.KEY_UP:
@@ -404,6 +424,12 @@ def run_picker(stdscr, groups, busy, running_ids):
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             if filt:
                 filt, sel, top = filt[:-1], 0, 0
+        elif key == 23:  # Ctrl-W: toggle missing dirs
+            show_missing = not show_missing
+            sel, top = 0, 0
+        elif key == 20:  # Ctrl-T: cycle age filter
+            age_idx = (age_idx + 1) % len(AGE_WINDOWS)
+            sel, top = 0, 0
         elif 32 <= key < 127:
             ch = chr(key)
             if ch == "q" and not filt:

@@ -238,3 +238,28 @@ def test_row_spans_badges_and_session():
     assert cr._row_spans(srow, 0, "/h") == [
         ("    ", "text"), ("  0s  ", "time"),
         ("(no prompt)", "text"), (" [running]", "running")]
+
+
+def test_flatten_rows_show_missing_and_min_ts():
+    live = _g("/p/live", [_s("s1", 5000)])
+    orphan = _g("/r/.claude/worktrees/w1", [_s("s2", 4000)])
+    gone = _g("/gone/x", [_s("s3", 3000)])
+    isdir = lambda p: p in ("/p/live", "/r")
+    rows = cr.flatten_rows([live, orphan, gone], expanded=set(), filt="",
+                           home="/h", busy=set(), running_ids=set(),
+                           isdir=isdir, show_missing=False)
+    assert [r["group"] for r in rows] == [live]
+    rows = cr.flatten_rows([live, orphan, gone], expanded=set(), filt="",
+                           home="/h", busy=set(), running_ids=set(),
+                           isdir=isdir, min_ts=4000)
+    assert [r["group"] for r in rows] == [live, orphan]  # boundary ts kept
+
+
+def test_flatten_rows_filters_apply_before_cap():
+    gone_groups = [_g(f"/gone/{i}", [_s(f"g{i}", 10_000 - i)])
+                   for i in range(cr.MAX_DIRS)]
+    live_old = _g("/p/old", [_s("old", 1)])
+    rows = cr.flatten_rows(gone_groups + [live_old], expanded=set(), filt="",
+                           home="/h", busy=set(), running_ids=set(),
+                           isdir=lambda p: p == "/p/old", show_missing=False)
+    assert len(rows) == 1 and rows[0]["group"] is live_old
