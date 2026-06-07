@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 python3 -m pytest -q                                   # run all tests (from repo root)
 python3 -m pytest tests/test_reclaude.py::test_mung_path -v   # single test
-uv run --group dev pytest -q                            # tests in an isolated env (as CI does)
+uv run --group dev --locked pytest -q                   # tests in an isolated env (as CI does)
 uv build                                                # build sdist + wheel into dist/
 reclaude                                                # run (needs a real TTY)
 ```

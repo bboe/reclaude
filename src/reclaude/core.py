@@ -21,25 +21,25 @@ def _row_spans(row, *, home, now_ms):
     every key emitted here.
     """
     if row["kind"] == "dir":
-        g = row["group"]
-        vis = row["vis_sessions"]
-        ts = vis[0]["ts"] if vis else g["last_ts"]
-        spans = [(f"{relative_time(ts, now_ms=now_ms):>4}  ", "time"),
-                 (abbreviate_path(g["path"], home=home), "path")]
+        group = row["group"]
+        visible = row["vis_sessions"]
+        newest_ts = visible[0]["ts"] if visible else group["last_ts"]
+        spans = [(f"{relative_time(newest_ts, now_ms=now_ms):>4}  ", "time"),
+                 (abbreviate_path(group["path"], home=home), "path")]
         if row["busy"]:
             spans.append((" [running]", "running"))
         if row["cls"] == "orphan-worktree":
             spans.append((" [worktree gone]", "orphan"))
         elif row["cls"] == "gone":
             spans.append((" [gone]", "gone"))
-        last = row["vis_sessions"][0]["display"] if row["vis_sessions"] else ""
-        if last:
-            spans.append((f"  —  {last}", "text"))
+        last_display = visible[0]["display"] if visible else ""
+        if last_display:
+            spans.append((f"  —  {last_display}", "text"))
         return spans
-    s = row["session"]
+    session = row["session"]
     spans = [("    ", "text"),
-             (f"{relative_time(s['ts'], now_ms=now_ms):>4}  ", "time"),
-             (s["display"] or "(no prompt)", "text")]
+             (f"{relative_time(session['ts'], now_ms=now_ms):>4}  ", "time"),
+             (session["display"] or "(no prompt)", "text")]
     if row.get("running"):
         spans.append((" [running]", "running"))
     return spans
@@ -63,9 +63,9 @@ def classify_dir(path, *, isdir=os.path.isdir):
     """
     if isdir(path):
         return ("live", None, None)
-    m = WORKTREE_RE.match(path)
-    if m and isdir(m.group("repo")):
-        return ("orphan-worktree", m.group("repo"), m.group("name"))
+    match = WORKTREE_RE.match(path)
+    if match and isdir(match.group("repo")):
+        return ("orphan-worktree", match.group("repo"), match.group("name"))
     return ("gone", None, None)
 
 
@@ -81,8 +81,8 @@ def find_busy_dirs(*, proc_root="/proc"):
             continue
         base = os.path.join(proc_root, name)
         try:
-            with open(os.path.join(base, "comm")) as f:
-                if f.read().strip() != "claude":
+            with open(os.path.join(base, "comm")) as file:
+                if file.read().strip() != "claude":
                     continue
             busy.add(os.path.realpath(os.path.join(base, "cwd")))
         except OSError:
@@ -90,8 +90,9 @@ def find_busy_dirs(*, proc_root="/proc"):
     return busy
 
 
-def flatten_rows(groups, *, busy, expanded, filt, home, isdir=os.path.isdir,
-                 min_ts=None, running_ids, show_missing=True):
+def flatten_rows(groups, *, busy, expanded, filter_text, home,
+                 isdir=os.path.isdir, min_ts=None, running_ids,
+                 show_missing=True):
     """Flatten groups + expansion state into the visible row list.
 
     Dir row:     {"busy", "cls", "group", "kind": "dir", "name", "repo",
@@ -104,30 +105,34 @@ def flatten_rows(groups, *, busy, expanded, filt, home, isdir=os.path.isdir,
     it has visible sessions and passes the missing-dir filter; dirs are
     capped at MAX_DIRS. Expanded dirs render only their visible sessions.
     """
-    f = filt.lower()
+    filter_lower = filter_text.lower()
     kept = []
-    for g in groups:
-        path_match = f in abbreviate_path(g["path"], home=home).lower()
-        vis = [s for s in g["sessions"]
-               if (min_ts is None or s["ts"] >= min_ts)
-               and (path_match or f in s["display"].lower())]
-        if not vis:
+    for group in groups:
+        path_match = filter_lower in abbreviate_path(
+            group["path"], home=home).lower()
+        visible = [session for session in group["sessions"]
+                   if (min_ts is None or session["ts"] >= min_ts)
+                   and (path_match
+                        or filter_lower in session["display"].lower())]
+        if not visible:
             continue
-        cls, repo, name = classify_dir(g["path"], isdir=isdir)
-        if not show_missing and cls != "live":
+        classification, repo, name = classify_dir(group["path"], isdir=isdir)
+        if not show_missing and classification != "live":
             continue
-        kept.append((g, vis, cls, repo, name))
+        kept.append((group, visible, classification, repo, name))
     rows = []
-    for g, vis, cls, repo, name in kept[:MAX_DIRS]:
-        b = _is_busy(g["path"], busy=busy)
-        rows.append({"busy": b, "cls": cls, "group": g, "kind": "dir",
-                     "name": name, "repo": repo, "vis_sessions": vis})
-        if g["path"] in expanded:
-            for s in vis:
-                rows.append({"busy": b, "cls": cls, "group": g,
-                             "kind": "session", "name": name, "repo": repo,
-                             "running": s["session_id"] in running_ids,
-                             "session": s})
+    for group, visible, classification, repo, name in kept[:MAX_DIRS]:
+        is_busy = _is_busy(group["path"], busy=busy)
+        rows.append({"busy": is_busy, "cls": classification, "group": group,
+                     "kind": "dir", "name": name, "repo": repo,
+                     "vis_sessions": visible})
+        if group["path"] in expanded:
+            for session in visible:
+                rows.append({"busy": is_busy, "cls": classification,
+                             "group": group, "kind": "session", "name": name,
+                             "repo": repo,
+                             "running": session["session_id"] in running_ids,
+                             "session": session})
     return rows
 
 
@@ -141,24 +146,26 @@ def group_by_home(entries, *, transcript_exists):
     with sessions newest-first.
     """
     sessions = {}
-    for e in entries:
-        s = sessions.setdefault(e["session_id"],
-                                {"display": "", "home": e["project"], "ts": 0})
-        if e["ts"] >= s["ts"]:
-            s["display"] = e["display"]
-            s["ts"] = e["ts"]
+    for entry in entries:
+        session = sessions.setdefault(
+            entry["session_id"],
+            {"display": "", "home": entry["project"], "ts": 0})
+        if entry["ts"] >= session["ts"]:
+            session["display"] = entry["display"]
+            session["ts"] = entry["ts"]
     dirs = {}
-    for sid, s in sessions.items():
-        if not transcript_exists(s["home"], session_id=sid):
+    for session_id, session in sessions.items():
+        if not transcript_exists(session["home"], session_id=session_id):
             continue
-        dirs.setdefault(s["home"], []).append(
-            {"display": s["display"], "session_id": sid, "ts": s["ts"]})
+        dirs.setdefault(session["home"], []).append(
+            {"display": session["display"], "session_id": session_id,
+             "ts": session["ts"]})
     groups = []
-    for path, sess in dirs.items():
-        sess.sort(key=lambda s: -s["ts"])
-        groups.append({"last_ts": sess[0]["ts"], "path": path,
-                       "sessions": sess})
-    groups.sort(key=lambda g: -g["last_ts"])
+    for path, dir_sessions in dirs.items():
+        dir_sessions.sort(key=lambda session: -session["ts"])
+        groups.append({"last_ts": dir_sessions[0]["ts"], "path": path,
+                       "sessions": dir_sessions})
+    groups.sort(key=lambda group: -group["last_ts"])
     return groups
 
 
@@ -179,31 +186,34 @@ def live_sessions(*, proc_root="/proc", sessions_dir=None):
         if not name.endswith(".json"):
             continue
         try:
-            with open(os.path.join(sessions_dir or SESSIONS_DIR, name)) as f:
-                rec = json.load(f)
+            record_path = os.path.join(sessions_dir or SESSIONS_DIR, name)
+            with open(record_path) as file:
+                record = json.load(file)
         except (OSError, ValueError):
             continue
-        if not isinstance(rec, dict):
+        if not isinstance(record, dict):
             continue
-        pid, cwd, sid = rec.get("pid"), rec.get("cwd"), rec.get("sessionId")
+        pid = record.get("pid")
+        cwd = record.get("cwd")
+        session_id = record.get("sessionId")
         if not (isinstance(pid, int) and isinstance(cwd, str)):
             continue
         try:
-            with open(os.path.join(proc_root, str(pid), "comm")) as f:
-                if f.read().strip() != "claude":
+            with open(os.path.join(proc_root, str(pid), "comm")) as file:
+                if file.read().strip() != "claude":
                     continue
         except OSError:
             continue
         busy.add(os.path.realpath(cwd))
-        if isinstance(sid, str):
-            running.add(sid)
+        if isinstance(session_id, str):
+            running.add(session_id)
     if not busy:
         busy = find_busy_dirs(proc_root=proc_root)
     return busy, running
 
 
 def mung_path(path):
-    """Munged ~/.claude/projects dir name for a path: '/' and '.' become '-'."""
+    """Munged ~/.claude/projects dir name: '/' and '.' become '-'."""
     return path.replace("/", "-").replace(".", "-")
 
 
@@ -212,41 +222,45 @@ def parse_history(lines):
     entries = []
     for line in lines:
         try:
-            obj = json.loads(line)
+            record = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(obj, dict):
+        if not isinstance(record, dict):
             continue
-        project = obj.get("project")
-        session_id = obj.get("sessionId")
-        ts = obj.get("timestamp")
-        display = obj.get("display")
+        project = record.get("project")
+        session_id = record.get("sessionId")
+        timestamp = record.get("timestamp")
+        display = record.get("display")
         if not (isinstance(project, str) and isinstance(session_id, str)
-                and isinstance(ts, (int, float)) and not isinstance(ts, bool)):
+                and isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)):
             continue
         if isinstance(display, str):
-            display = " ".join(display.split())
+            # Flatten whitespace, then drop remaining control characters
+            # (e.g. \x1b) so prompts can't smuggle escape sequences.
+            display = "".join(char for char in " ".join(display.split())
+                              if char.isprintable())
         else:
             display = ""
         entries.append({
             "display": display,
             "project": project,
             "session_id": session_id,
-            "ts": ts,
+            "ts": timestamp,
         })
     return entries
 
 
 def relative_time(ts_ms, *, now_ms):
     """Compact age like '5s', '3m', '7h', '2d'."""
-    secs = max(0, int((now_ms - ts_ms) / 1000))
-    if secs < 60:
-        return f"{secs}s"
-    if secs < 3600:
-        return f"{secs // 60}m"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    return f"{secs // 86400}d"
+    seconds = max(0, int((now_ms - ts_ms) / 1000))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
 
 
 def transcript_exists(home_dir, *, projects_dir=None, session_id):
@@ -259,9 +273,9 @@ def transcript_path(home_dir, *, projects_dir=None, session_id):
                         mung_path(home_dir), session_id + ".jsonl")
 
 
-def truncate(s, *, width):
+def truncate(text, *, width):
     if width <= 0:
         return ""
-    if len(s) <= width:
-        return s
-    return s[: width - 1] + "…"
+    if len(text) <= width:
+        return text
+    return text[: width - 1] + "…"

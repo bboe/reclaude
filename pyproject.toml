@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pre-commit", "pytest"]
 
 [project]
 authors = [{ email = "bbzbryce@gmail.com", name = "Bryce Boe" }]
