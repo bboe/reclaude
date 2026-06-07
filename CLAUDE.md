@@ -12,6 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python3 -m pytest -q                                   # run all tests (from repo root)
 python3 -m pytest tests/test_reclaude.py::test_mung_path -v   # single test
 uv run --group dev --locked pytest -q                   # tests in an isolated env (as CI does)
+uv run --group dev pre-commit run --all-files           # ruff check + ruff format (lint.select = ALL, preview)
 uv build                                                # build sdist + wheel into dist/
 reclaude                                                # run (needs a real TTY)
 ```
@@ -48,5 +49,6 @@ If claude changes any of this, re-verify empirically (cheap probe: `claude --res
 ## Workflow conventions
 
 - TDD for pure functions; the curses layer changes get fake-stdscr smoke tests instead.
-- **Everything sortable is sorted.** Functions lexicographically within each module (ASCII order, so `_private` first); dict keys, container items, TOML/YAML keys, and constants wherever order has no semantic meaning. Parameters after the first are keyword-only (`*`), declared and passed in alphabetical order. Workflow YAML keys are fully sorted, including top-level (`jobs`/`name`/`on`) and job-level keys. Deliberate exceptions: `AGE_WINDOWS` (Ctrl-T cycle order), `classify_dir`'s return tuple, span lists, and workflow `steps` (execution order).
+- ruff runs with `lint.select = ["ALL"]` + `preview = true`; formatting is ruff-format-owned. The small ignore list and the tests' per-file-ignores live in `pyproject.toml`, each entry justified by a comment — extend them only with a reason, never to dodge a fixable finding. Everything is type-annotated (rows/groups are TypedDicts in `core.py`); `flatten_rows` takes its criteria as a frozen `RowFilter` dataclass and the picker loop is split into small `_handle_*`/`_build_frame` helpers to satisfy the complexity rules.
+- **Everything sortable is sorted.** Functions lexicographically within each module (ASCII order, so `_private` first); dict keys, container items, TOML/YAML keys, and constants wherever order has no semantic meaning. Parameters are mandatory-keyword (`*`), declared and passed in alphabetical order; the only exception is when the function name makes a positional argument's meaning 100% obvious (`mung_path(path)`, `truncate(text)`, `_die(message)`...), in which case it is mandatory-positional (`/`). Plain positional-or-keyword parameters never appear (enforced by `tests/test_conventions.py`; lambdas excepted — they can't express `/`). Workflow YAML keys are fully sorted, including top-level (`jobs`/`name`/`on`) and job-level keys. Deliberate exceptions: `AGE_WINDOWS` (Ctrl-T cycle order), `classify_dir`'s return tuple, span lists, and workflow `steps` (execution order).
 - Commits are conventional-commit style (`feat:`, `fix:`, `chore:`, `polish:`). No standalone `docs:` or `test:` commits — documentation and test changes ride along in the feature or bugfix commit they belong to.

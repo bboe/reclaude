@@ -3,7 +3,7 @@ build-backend = "hatchling.build"
 requires = ["hatchling"]
 
 [dependency-groups]
-dev = ["pre-commit", "pytest"]
+dev = ["pre-commit", "pytest", "pyyaml"]
 
 [project]
 authors = [{ email = "bbzbryce@gmail.com", name = "Bryce Boe" }]
@@ -41,3 +41,24 @@ packages = ["src/reclaude"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff]
+preview = true
+
+[tool.ruff.lint]
+ignore = [
+    "COM812", # formatter-incompatible per ruff's own guidance
+    "CPY001", # LICENSE carries the copyright; no per-file headers
+    "D203",   # one-blank-line-before-class conflicts with D211
+    "D213",   # multi-line-summary-second-line conflicts with D212
+    "ISC001", # formatter-incompatible per ruff's own guidance
+]
+select = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D1",      # tests are named, not documented
+    "INP001",  # tests/ is intentionally not a package
+    "PLR2004", # literal timestamps/pids/indexes are the fixtures
+    "S101",    # assert is pytest's assertion mechanism
+]
