@@ -12,12 +12,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from reclaude.core import (
+    MS_PER_DAY,
+    MS_PER_HOUR,
+    Launch,
     RowFilter,
-    _row_spans,
+    clamp_scroll,
     flatten_rows,
     group_by_home,
     live_sessions,
     parse_history,
+    row_spans,
     transcript_exists,
     truncate,
 )
@@ -30,12 +34,12 @@ if TYPE_CHECKING:
 # AGE_WINDOWS is in Ctrl-T cycle order (coarsest to finest), not sorted.
 AGE_WINDOWS = [
     ("all", None),
-    ("1mo", 30 * 86400_000),
-    ("1w", 7 * 86400_000),
-    ("1d", 86400_000),
-    ("1h", 3600_000),
+    ("1mo", 30 * MS_PER_DAY),
+    ("1w", 7 * MS_PER_DAY),
+    ("1d", MS_PER_DAY),
+    ("1h", MS_PER_HOUR),
 ]
-# COLOR_KEYS must cover every key that core._row_spans emits.
+# COLOR_KEYS must cover every key that core.row_spans emits.
 COLOR_KEYS = ("flash", "gone", "orphan", "path", "running", "text", "time")
 FLASH_BUSY = "that directory already has a claude session running"
 FLASH_GONE = "directory no longer exists"
@@ -90,6 +94,25 @@ class _PickerState:
     show_missing: bool = True
 
 
+def _addstr(stdscr: curses.window, /, *, attr: int, text: str, x: int, y: int) -> int:
+    """Write text at (y, x), clipped to the screen's last writable column.
+
+    Centralizes the "at most maxx - 1 columns, tolerate curses errors" rule
+    (tiny terminals, bottom-right cell quirk).
+
+    Returns:
+        The number of columns written (0 when nothing fits).
+
+    """
+    avail = stdscr.getmaxyx()[1] - 1 - x
+    if avail <= 0:
+        return 0
+    clipped = truncate(text, width=avail)
+    with contextlib.suppress(curses.error):
+        stdscr.addnstr(y, x, clipped, avail, attr)
+    return len(clipped)
+
+
 def _build_frame(
     *,
     context: _PickerContext,
@@ -108,8 +131,8 @@ def _build_frame(
     """
     render_rows = [
         (
-            _row_spans(row, home=context.home, now_ms=now_ms),
-            curses.A_DIM if (row["busy"] or row["cls"] == "gone") else 0,
+            row_spans(row, home=context.home, now_ms=now_ms),
+            curses.A_DIM if (row["busy"] or row["cls"].kind == "gone") else 0,
         )
         for row in rows
     ]
@@ -165,15 +188,10 @@ def _draw(stdscr: curses.window, /, *, attrs: dict[str, int], frame: _Frame) -> 
     maxy, maxx = stdscr.getmaxyx()
     # maxy==1: header only; maxy==2: header (y=0) + footer (y=1), no body rows.
     body = max(0, maxy - 2)
-    scroll_top = frame.scroll_top
-    if frame.selection < scroll_top:
-        scroll_top = frame.selection
-    elif body > 0 and frame.selection >= scroll_top + body:
-        scroll_top = frame.selection - body + 1
-    with contextlib.suppress(curses.error):
-        stdscr.addnstr(
-            0, 0, truncate(frame.title, width=maxx - 1), maxx - 1, curses.A_BOLD
-        )
+    scroll_top = clamp_scroll(
+        body=body, scroll_top=frame.scroll_top, selection=frame.selection
+    )
+    _addstr(stdscr, attr=curses.A_BOLD, text=frame.title, x=0, y=0)
     visible = frame.render_rows[scroll_top : scroll_top + body]
     for index, (spans, extra_attr) in enumerate(visible):
         row_attr = extra_attr | (
@@ -181,55 +199,37 @@ def _draw(stdscr: curses.window, /, *, attrs: dict[str, int], frame: _Frame) -> 
         )
         x = 0
         for text, key in spans:
-            avail = maxx - 1 - x
-            if avail <= 0:
+            if x >= maxx - 1:
                 break
-            clipped = truncate(text, width=avail)
-            with contextlib.suppress(curses.error):
-                stdscr.addnstr(
-                    1 + index,
-                    x,
-                    clipped,
-                    avail,
-                    attrs.get(key, curses.A_NORMAL) | row_attr,
-                )
-            x += len(clipped)
-        if x < maxx - 1:  # pad so the selection bar spans the line
-            with contextlib.suppress(curses.error):
-                stdscr.addnstr(
-                    1 + index, x, " " * (maxx - 1 - x), maxx - 1 - x, row_attr
-                )
-    if maxy >= _MIN_ROWS_WITH_FOOTER:
-        with contextlib.suppress(curses.error):
-            stdscr.addnstr(
-                maxy - 1,
-                0,
-                truncate(frame.footer, width=maxx - 1),
-                maxx - 1,
-                frame.footer_attr,
+            x += _addstr(
+                stdscr,
+                attr=attrs.get(key, curses.A_NORMAL) | row_attr,
+                text=text,
+                x=x,
+                y=1 + index,
             )
+        if x < maxx - 1:  # pad so the selection bar spans the line
+            _addstr(stdscr, attr=row_attr, text=" " * (maxx - 1 - x), x=x, y=1 + index)
+    if maxy >= _MIN_ROWS_WITH_FOOTER:
+        _addstr(stdscr, attr=frame.footer_attr, text=frame.footer, x=0, y=maxy - 1)
     stdscr.refresh()
     return scroll_top
 
 
-def _exec_claude(*, result: tuple[str, ...]) -> NoReturn:
+def _exec_claude(*, launch: Launch) -> NoReturn:
     """Chdir to the picked directory and exec claude on the picked session."""
-    if result[0] == "worktree":
-        _, path, name, session_id = result
-        argv = ["claude", "--worktree", name, "--resume", session_id]
-    else:
-        _, path, session_id = result
-        argv = ["claude", "--resume", session_id]
-    for value in argv[2::2]:  # option values come from history.jsonl;
-        if value.startswith("-"):  # never let one be parsed as an option
+    for value in (launch.session_id, launch.worktree_name):
+        # Option values come from history.jsonl; never let one be parsed as
+        # an option.
+        if value is not None and value.startswith("-"):
             _die(f"refusing option-like argument {value!r}")
     try:
-        os.chdir(path)
+        os.chdir(launch.path)
     except OSError as error:
-        _die(f"cannot chdir to {path}: {error}")
+        _die(f"cannot chdir to {launch.path}: {error}")
     try:
         # exec'ing claude from PATH is this program's entire purpose.
-        os.execvp("claude", argv)  # noqa: S606, S607
+        os.execvp("claude", launch.argv)  # noqa: S606, S607
     except OSError as error:
         _die(f"cannot exec claude: {error}")
 
@@ -237,41 +237,41 @@ def _exec_claude(*, result: tuple[str, ...]) -> NoReturn:
 def _handle_filter_key(key: int, /, *, state: _PickerState) -> bool:
     """Apply a filter/toggle key (Esc, backspace, ^W, ^T, printable) to state.
 
+    Any change to the filter criteria resets the selection and scroll.
+
     Returns:
         True when the picker should quit (Esc or q with an empty filter).
 
     """
+    before = (state.age_index, state.filter_text, state.show_missing)
     if key == _KEY_ESCAPE:
         if not state.filter_text:
             return True
         state.filter_text = ""
-        _reset_scroll(state=state)
     elif key in _BACKSPACE_KEYS:
-        if state.filter_text:
-            state.filter_text = state.filter_text[:-1]
-            _reset_scroll(state=state)
+        state.filter_text = state.filter_text[:-1]
     elif key == _KEY_CTRL_W:  # toggle missing dirs
         state.show_missing = not state.show_missing
-        _reset_scroll(state=state)
     elif key == _KEY_CTRL_T:  # cycle age filter
         state.age_index = (state.age_index + 1) % len(AGE_WINDOWS)
-        _reset_scroll(state=state)
     elif key in _PRINTABLE_KEYS:
         character = chr(key)
         if character == "q" and not state.filter_text:
             return True
         state.filter_text += character
-        _reset_scroll(state=state)
+    if (state.age_index, state.filter_text, state.show_missing) != before:
+        state.scroll_top = 0
+        state.selection = 0
     return False
 
 
 def _handle_nav_key(
     key: int, /, *, rows: list[DirRow | SessionRow], state: _PickerState
-) -> tuple[str, ...] | None:
+) -> Launch | None:
     """Apply a navigation key (arrows, enter, tab) to state.
 
     Returns:
-        A launch tuple when enter resumes a session, else None.
+        A Launch when enter resumes a session, else None.
 
     """
     if key == curses.KEY_UP:
@@ -288,17 +288,22 @@ def _handle_nav_key(
     return None
 
 
-def _launch(*, row: DirRow | SessionRow, session_id: str) -> tuple[str, ...]:
-    """Build the launch tuple for a row's session.
+def _launch(*, row: DirRow | SessionRow, session_id: str) -> Launch:
+    """Build the Launch for a row's session.
 
     Returns:
-        ("worktree", repo, name, id) for orphaned worktrees, else
-        ("resume", path, id).
+        A worktree-resurrecting Launch for orphaned worktrees, else a plain
+        resume in the row's directory.
 
     """
-    if row["cls"] == "orphan-worktree":
-        return ("worktree", row["repo"], row["name"], session_id)
-    return ("resume", row["group"]["path"], session_id)
+    classification = row["cls"]
+    if classification.kind == "orphan-worktree":
+        return Launch(
+            path=classification.repo,
+            session_id=session_id,
+            worktree_name=classification.name,
+        )
+    return Launch(path=row["group"]["path"], session_id=session_id)
 
 
 def _load_groups() -> list[Group]:
@@ -319,27 +324,21 @@ def _load_groups() -> list[Group]:
     return groups
 
 
-def _reset_scroll(*, state: _PickerState) -> None:
-    """Reset the selection and scroll offset after the row list changed."""
-    state.scroll_top = 0
-    state.selection = 0
-
-
 def _select_row(
     *, rows: list[DirRow | SessionRow], state: _PickerState
-) -> tuple[str, ...] | None:
+) -> Launch | None:
     """Resolve enter on the selected row.
 
     Returns:
-        The launch tuple for the selected session (a dir row launches its
-        newest visible session — display = action), or None with a flash set
-        when the row is busy or gone.
+        The Launch for the selected session (a dir row launches its newest
+        visible session — display = action), or None with a flash set when
+        the row is busy or gone.
 
     """
     row = rows[state.selection]
     if row["busy"]:
         state.flash = FLASH_BUSY
-    elif row["cls"] == "gone":
+    elif row["cls"].kind == "gone":
         state.flash = FLASH_GONE
     elif row["kind"] == "session":
         return _launch(row=row, session_id=row["session"]["session_id"])
@@ -419,7 +418,7 @@ def main() -> None:
     )
     if result is None:
         return
-    _exec_claude(result=result)
+    _exec_claude(launch=result)
 
 
 def run_picker(
@@ -429,11 +428,11 @@ def run_picker(
     busy: set[str],
     groups: list[Group],
     running_ids: set[str],
-) -> tuple[str, ...] | None:
+) -> Launch | None:
     """Run the picker event loop.
 
     Returns:
-        ('resume', path, id) | ('worktree', repo, name, id) | None.
+        The Launch for the picked session, or None when the user quit.
 
     """
     with contextlib.suppress(curses.error):

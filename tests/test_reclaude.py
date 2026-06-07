@@ -50,24 +50,29 @@ def test_abbreviate_path() -> None:
     assert core.abbreviate_path("/etc/x", home="/home/u") == "/etc/x"
 
 
+def test_clamp_scroll() -> None:
+    assert core.clamp_scroll(body=5, scroll_top=0, selection=2) == 0  # visible: keep
+    assert core.clamp_scroll(body=5, scroll_top=4, selection=2) == 2  # above: snap up
+    assert core.clamp_scroll(body=5, scroll_top=0, selection=7) == 3  # below: snap down
+    assert core.clamp_scroll(body=0, scroll_top=3, selection=9) == 3  # no body: keep
+
+
 def test_classify_dir() -> None:
-    assert core.classify_dir("/x", isdir=lambda _path: True) == ("live", None, None)
+    assert core.classify_dir("/x", isdir=lambda _path: True) == core.Classification(
+        kind="live"
+    )
     assert core.classify_dir(
         "/r/.claude/worktrees/a1", isdir=lambda path: path == "/r"
-    ) == ("orphan-worktree", "/r", "a1")
-    assert core.classify_dir("/gone/dir", isdir=lambda _path: False) == (
-        "gone",
-        None,
-        None,
-    )
+    ) == core.Classification(kind="orphan-worktree", name="a1", repo="/r")
+    assert core.classify_dir(
+        "/gone/dir", isdir=lambda _path: False
+    ) == core.Classification(kind="gone")
 
 
 def test_classify_dir_worktree_repo_also_gone() -> None:
-    assert core.classify_dir("/r/.claude/worktrees/a1", isdir=lambda _path: False) == (
-        "gone",
-        None,
-        None,
-    )
+    assert core.classify_dir(
+        "/r/.claude/worktrees/a1", isdir=lambda _path: False
+    ) == core.Classification(kind="gone")
 
 
 def test_find_busy_dirs(*, tmp_path: Path) -> None:
@@ -128,8 +133,9 @@ def test_flatten_rows_busy_and_classification() -> None:
         ),
         groups=[group],
     )
-    assert rows[0]["cls"] == "orphan-worktree"
-    assert (rows[0]["repo"], rows[0]["name"]) == ("/r", "a1")
+    assert rows[0]["cls"] == core.Classification(
+        kind="orphan-worktree", name="a1", repo="/r"
+    )
     assert rows[0]["busy"] is True
     assert rows[1]["busy"] is True
 
@@ -286,6 +292,13 @@ def test_group_by_home_drops_sessions_without_transcript() -> None:
     assert [session["session_id"] for session in groups[1]["sessions"]] == ["s1"]
 
 
+def test_launch_argv() -> None:
+    launch = core.Launch(path="/p", session_id="s1")
+    assert launch.argv == ["claude", "--resume", "s1"]
+    launch = core.Launch(path="/r", session_id="s2", worktree_name="w1")
+    assert launch.argv == ["claude", "--worktree", "w1", "--resume", "s2"]
+
+
 def test_live_sessions(*, tmp_path: Path) -> None:
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
@@ -395,29 +408,25 @@ def test_row_spans_badges_and_session() -> None:
     )
     row = core.DirRow(
         busy=False,
-        cls="orphan-worktree",
+        cls=core.Classification(kind="orphan-worktree", name="a1", repo="/r"),
         group=group,
         kind="dir",
-        name="a1",
-        repo="/r",
         vis_sessions=group["sessions"],
     )
-    spans = core._row_spans(row, home="/h", now_ms=0)  # noqa: SLF001
+    spans = core.row_spans(row, home="/h", now_ms=0)
     assert (" [worktree gone]", "orphan") in spans
-    row["cls"] = "gone"
-    spans = core._row_spans(row, home="/h", now_ms=0)  # noqa: SLF001
+    row["cls"] = core.Classification(kind="gone")
+    spans = core.row_spans(row, home="/h", now_ms=0)
     assert (" [gone]", "gone") in spans
     session_row = core.SessionRow(
         busy=False,
-        cls="live",
+        cls=core.Classification(kind="live"),
         group=group,
         kind="session",
-        name=None,
-        repo=None,
         running=True,
         session=_session(session_id="s1", ts=0),
     )
-    assert core._row_spans(session_row, home="/h", now_ms=0) == [  # noqa: SLF001
+    assert core.row_spans(session_row, home="/h", now_ms=0) == [
         ("    ", "text"),
         ("  0s  ", "time"),
         ("(no prompt)", "text"),
@@ -435,15 +444,13 @@ def test_row_spans_dir() -> None:
     )
     row = core.DirRow(
         busy=True,
-        cls="live",
+        cls=core.Classification(kind="live"),
         group=group,
         kind="dir",
-        name=None,
-        repo=None,
         vis_sessions=group["sessions"][1:],
     )
     # time and prompt come from the newest VISIBLE session (s0), not s1
-    assert core._row_spans(row, home="/h", now_ms=120_000) == [  # noqa: SLF001
+    assert core.row_spans(row, home="/h", now_ms=120_000) == [
         ("  2m  ", "time"),
         ("~/proj", "path"),
         (" [running]", "running"),
