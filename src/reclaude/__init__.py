@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """reclaude: curses picker for recent Claude Code sessions.
 
 Reads ~/.claude/history.jsonl, shows recent project directories as an
@@ -475,7 +474,3 @@ def main():
         os.execvp("claude", argv)
     except OSError as e:
         sys.exit(f"reclaude: cannot exec claude: {e}")
-
-
-if __name__ == "__main__":
-    main()
