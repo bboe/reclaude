@@ -1,0 +1,11 @@
+updates:
+  - directory: /
+    package-ecosystem: github-actions
+    schedule:
+      interval: weekly
+  - directory: /
+    package-ecosystem: uv
+    schedule:
+      interval: weekly
+
+version: 2
