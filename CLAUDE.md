@@ -48,4 +48,5 @@ If claude changes any of this, re-verify empirically (cheap probe: `claude --res
 ## Workflow conventions
 
 - TDD for pure functions; the curses layer changes get fake-stdscr smoke tests instead.
+- **Everything sortable is sorted.** Functions lexicographically within each half (ASCII order, so `_private` first); dict keys, container items, TOML/YAML keys, and constants wherever order has no semantic meaning. Parameters after the first are keyword-only (`*`), declared and passed in alphabetical order. Deliberate exceptions: `AGE_WINDOWS` (Ctrl-T cycle order), `classify_dir`'s return tuple, span lists, workflow `steps`, and the `name:/on:/jobs:` workflow header convention.
 - Commits are conventional-commit style (`feat:`, `fix:`, `chore:`, `polish:`). No standalone `docs:` or `test:` commits — documentation and test changes ride along in the feature or bugfix commit they belong to.

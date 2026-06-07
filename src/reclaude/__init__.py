@@ -12,90 +12,68 @@ import re
 import sys
 import time
 
+# AGE_WINDOWS is in Ctrl-T cycle order (coarsest to finest), not sorted.
+AGE_WINDOWS = [("all", None), ("1mo", 30 * 86400_000), ("1w", 7 * 86400_000),
+               ("1d", 86400_000), ("1h", 3600_000)]
+# COLOR_KEYS must cover every key that _row_spans emits.
+COLOR_KEYS = ("flash", "gone", "orphan", "path", "running", "text", "time")
+FLASH_BUSY = "that directory already has a claude session running"
+FLASH_GONE = "directory no longer exists"
+HELP = ("↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
+        "^T age · type to filter · q quit")
 HISTORY_PATH = os.path.expanduser("~/.claude/history.jsonl")
 MAX_DIRS = 30
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
-
-
-def parse_history(lines):
-    """Parse history.jsonl lines into entry dicts, skipping malformed lines."""
-    entries = []
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(obj, dict):
-            continue
-        project = obj.get("project")
-        session_id = obj.get("sessionId")
-        ts = obj.get("timestamp")
-        display = obj.get("display")
-        if not (isinstance(project, str) and isinstance(session_id, str)
-                and isinstance(ts, (int, float)) and not isinstance(ts, bool)):
-            continue
-        if isinstance(display, str):
-            display = " ".join(display.split())
-        else:
-            display = ""
-        entries.append({
-            "project": project,
-            "session_id": session_id,
-            "ts": ts,
-            "display": display,
-        })
-    return entries
-
-
-def mung_path(path):
-    """Munged ~/.claude/projects dir name for a path: '/' and '.' become '-'."""
-    return path.replace("/", "-").replace(".", "-")
-
-
-def transcript_path(home_dir, session_id, projects_dir=None):
-    return os.path.join(projects_dir or PROJECTS_DIR,
-                        mung_path(home_dir), session_id + ".jsonl")
-
-
-def transcript_exists(home_dir, session_id, projects_dir=None):
-    return os.path.isfile(transcript_path(home_dir, session_id, projects_dir))
-
-
-def group_by_home(entries, transcript_exists=transcript_exists):
-    """Group sessions under their home dir (first project seen), newest first.
-
-    A session's transcript lives where the session started, so that first
-    directory is the only place `claude --resume` can find it. Sessions whose
-    transcript no longer exists are dropped. Each group:
-    {"path", "last_ts", "sessions": [{"session_id", "ts", "display"}, ...]}
-    with sessions newest-first.
-    """
-    sessions = {}
-    for e in entries:
-        s = sessions.setdefault(e["session_id"],
-                                {"home": e["project"], "ts": 0, "display": ""})
-        if e["ts"] >= s["ts"]:
-            s["ts"] = e["ts"]
-            s["display"] = e["display"]
-    dirs = {}
-    for sid, s in sessions.items():
-        if not transcript_exists(s["home"], sid):
-            continue
-        dirs.setdefault(s["home"], []).append(
-            {"session_id": sid, "ts": s["ts"], "display": s["display"]})
-    groups = []
-    for path, sess in dirs.items():
-        sess.sort(key=lambda s: -s["ts"])
-        groups.append({"path": path, "last_ts": sess[0]["ts"], "sessions": sess})
-    groups.sort(key=lambda g: -g["last_ts"])
-    return groups
-
-
 WORKTREE_RE = re.compile(r"^(?P<repo>.+)/\.claude/worktrees/(?P<name>[^/]+)$")
 
 
-def classify_dir(path, isdir=os.path.isdir):
+# Pure functions (unit-tested), sorted lexicographically.
+
+def _is_busy(path, *, busy):
+    return os.path.realpath(path) in busy
+
+
+def _row_spans(row, *, home, now_ms):
+    """Render a flatten_rows row as [(text, colorkey)] spans.
+
+    Color keys: "gone", "orphan", "path", "running", "text", "time" — mapped
+    to curses attributes by init_colors().
+    """
+    if row["kind"] == "dir":
+        g = row["group"]
+        vis = row["vis_sessions"]
+        ts = vis[0]["ts"] if vis else g["last_ts"]
+        spans = [(f"{relative_time(ts, now_ms=now_ms):>4}  ", "time"),
+                 (abbreviate_path(g["path"], home=home), "path")]
+        if row["busy"]:
+            spans.append((" [running]", "running"))
+        if row["cls"] == "orphan-worktree":
+            spans.append((" [worktree gone]", "orphan"))
+        elif row["cls"] == "gone":
+            spans.append((" [gone]", "gone"))
+        last = row["vis_sessions"][0]["display"] if row["vis_sessions"] else ""
+        if last:
+            spans.append((f"  —  {last}", "text"))
+        return spans
+    s = row["session"]
+    spans = [("    ", "text"),
+             (f"{relative_time(s['ts'], now_ms=now_ms):>4}  ", "time"),
+             (s["display"] or "(no prompt)", "text")]
+    if row.get("running"):
+        spans.append((" [running]", "running"))
+    return spans
+
+
+def abbreviate_path(path, *, home):
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def classify_dir(path, *, isdir=os.path.isdir):
     """Classify a session home dir.
 
     Returns (kind, repo, name): kind is "live" (dir exists), "orphan-worktree"
@@ -111,7 +89,7 @@ def classify_dir(path, isdir=os.path.isdir):
     return ("gone", None, None)
 
 
-def find_busy_dirs(proc_root="/proc"):
+def find_busy_dirs(*, proc_root="/proc"):
     """Return the set of realpath cwds of running `claude` processes."""
     busy = set()
     try:
@@ -132,7 +110,79 @@ def find_busy_dirs(proc_root="/proc"):
     return busy
 
 
-def live_sessions(sessions_dir=None, proc_root="/proc"):
+def flatten_rows(groups, *, busy, expanded, filt, home, isdir=os.path.isdir,
+                 min_ts=None, running_ids, show_missing=True):
+    """Flatten groups + expansion state into the visible row list.
+
+    Dir row:     {"busy", "cls", "group", "kind": "dir", "name", "repo",
+                  "vis_sessions"}
+    Session row: {"busy", "cls", "group", "kind": "session", "name", "repo",
+                  "running", "session"}.
+    A session is visible iff it passes the age window (min_ts) and the text
+    filter — a dir-path match admits all its sessions, otherwise the prompt
+    text must contain the filter (both case-insensitive). A dir is shown iff
+    it has visible sessions and passes the missing-dir filter; dirs are
+    capped at MAX_DIRS. Expanded dirs render only their visible sessions.
+    """
+    f = filt.lower()
+    kept = []
+    for g in groups:
+        path_match = f in abbreviate_path(g["path"], home=home).lower()
+        vis = [s for s in g["sessions"]
+               if (min_ts is None or s["ts"] >= min_ts)
+               and (path_match or f in s["display"].lower())]
+        if not vis:
+            continue
+        cls, repo, name = classify_dir(g["path"], isdir=isdir)
+        if not show_missing and cls != "live":
+            continue
+        kept.append((g, vis, cls, repo, name))
+    rows = []
+    for g, vis, cls, repo, name in kept[:MAX_DIRS]:
+        b = _is_busy(g["path"], busy=busy)
+        rows.append({"busy": b, "cls": cls, "group": g, "kind": "dir",
+                     "name": name, "repo": repo, "vis_sessions": vis})
+        if g["path"] in expanded:
+            for s in vis:
+                rows.append({"busy": b, "cls": cls, "group": g,
+                             "kind": "session", "name": name, "repo": repo,
+                             "running": s["session_id"] in running_ids,
+                             "session": s})
+    return rows
+
+
+def group_by_home(entries, *, transcript_exists):
+    """Group sessions under their home dir (first project seen), newest first.
+
+    A session's transcript lives where the session started, so that first
+    directory is the only place `claude --resume` can find it. Sessions whose
+    transcript no longer exists are dropped. Each group:
+    {"last_ts", "path", "sessions": [{"display", "session_id", "ts"}, ...]}
+    with sessions newest-first.
+    """
+    sessions = {}
+    for e in entries:
+        s = sessions.setdefault(e["session_id"],
+                                {"display": "", "home": e["project"], "ts": 0})
+        if e["ts"] >= s["ts"]:
+            s["display"] = e["display"]
+            s["ts"] = e["ts"]
+    dirs = {}
+    for sid, s in sessions.items():
+        if not transcript_exists(s["home"], session_id=sid):
+            continue
+        dirs.setdefault(s["home"], []).append(
+            {"display": s["display"], "session_id": sid, "ts": s["ts"]})
+    groups = []
+    for path, sess in dirs.items():
+        sess.sort(key=lambda s: -s["ts"])
+        groups.append({"last_ts": sess[0]["ts"], "path": path,
+                       "sessions": sess})
+    groups.sort(key=lambda g: -g["last_ts"])
+    return groups
+
+
+def live_sessions(*, proc_root="/proc", sessions_dir=None):
     """Busy dirs and running session ids from ~/.claude/sessions records.
 
     Each <pid>.json record counts only if /proc/<pid>/comm is "claude" (stale
@@ -168,11 +218,46 @@ def live_sessions(sessions_dir=None, proc_root="/proc"):
         if isinstance(sid, str):
             running.add(sid)
     if not busy:
-        busy = find_busy_dirs(proc_root)
+        busy = find_busy_dirs(proc_root=proc_root)
     return busy, running
 
 
-def relative_time(ts_ms, now_ms):
+def mung_path(path):
+    """Munged ~/.claude/projects dir name for a path: '/' and '.' become '-'."""
+    return path.replace("/", "-").replace(".", "-")
+
+
+def parse_history(lines):
+    """Parse history.jsonl lines into entry dicts, skipping malformed lines."""
+    entries = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        project = obj.get("project")
+        session_id = obj.get("sessionId")
+        ts = obj.get("timestamp")
+        display = obj.get("display")
+        if not (isinstance(project, str) and isinstance(session_id, str)
+                and isinstance(ts, (int, float)) and not isinstance(ts, bool)):
+            continue
+        if isinstance(display, str):
+            display = " ".join(display.split())
+        else:
+            display = ""
+        entries.append({
+            "display": display,
+            "project": project,
+            "session_id": session_id,
+            "ts": ts,
+        })
+    return entries
+
+
+def relative_time(ts_ms, *, now_ms):
     """Compact age like '5s', '3m', '7h', '2d'."""
     secs = max(0, int((now_ms - ts_ms) / 1000))
     if secs < 60:
@@ -184,15 +269,17 @@ def relative_time(ts_ms, now_ms):
     return f"{secs // 86400}d"
 
 
-def abbreviate_path(path, home):
-    if path == home:
-        return "~"
-    if path.startswith(home + os.sep):
-        return "~" + path[len(home):]
-    return path
+def transcript_exists(home_dir, *, projects_dir=None, session_id):
+    return os.path.isfile(transcript_path(home_dir, projects_dir=projects_dir,
+                                          session_id=session_id))
 
 
-def truncate(s, width):
+def transcript_path(home_dir, *, projects_dir=None, session_id):
+    return os.path.join(projects_dir or PROJECTS_DIR,
+                        mung_path(home_dir), session_id + ".jsonl")
+
+
+def truncate(s, *, width):
     if width <= 0:
         return ""
     if len(s) <= width:
@@ -200,77 +287,9 @@ def truncate(s, width):
     return s[: width - 1] + "…"
 
 
-def _is_busy(path, busy):
-    return os.path.realpath(path) in busy
+# Curses layer (no unit tests), sorted lexicographically.
 
-
-def flatten_rows(groups, expanded, filt, home, busy, running_ids,
-                 isdir=os.path.isdir, show_missing=True, min_ts=None):
-    """Flatten groups + expansion state into the visible row list.
-
-    Dir row:     {"kind": "dir", "group", "vis_sessions", "cls", "repo",
-                  "name", "busy"}
-    Session row: {"kind": "session", "group", "session", "cls", "repo",
-                  "name", "busy", "running"}.
-    A session is visible iff it passes the age window (min_ts) and the text
-    filter — a dir-path match admits all its sessions, otherwise the prompt
-    text must contain the filter (both case-insensitive). A dir is shown iff
-    it has visible sessions and passes the missing-dir filter; dirs are
-    capped at MAX_DIRS. Expanded dirs render only their visible sessions.
-    """
-    f = filt.lower()
-    kept = []
-    for g in groups:
-        path_match = f in abbreviate_path(g["path"], home).lower()
-        vis = [s for s in g["sessions"]
-               if (min_ts is None or s["ts"] >= min_ts)
-               and (path_match or f in s["display"].lower())]
-        if not vis:
-            continue
-        cls, repo, name = classify_dir(g["path"], isdir)
-        if not show_missing and cls != "live":
-            continue
-        kept.append((g, vis, cls, repo, name))
-    rows = []
-    for g, vis, cls, repo, name in kept[:MAX_DIRS]:
-        b = _is_busy(g["path"], busy)
-        rows.append({"kind": "dir", "group": g, "vis_sessions": vis,
-                     "cls": cls, "repo": repo, "name": name, "busy": b})
-        if g["path"] in expanded:
-            for s in vis:
-                rows.append({"kind": "session", "group": g, "session": s,
-                             "cls": cls, "repo": repo, "name": name, "busy": b,
-                             "running": s["session_id"] in running_ids})
-    return rows
-
-
-# COLOR_KEYS must cover every key that _row_spans emits.
-COLOR_KEYS = ("time", "path", "running", "orphan", "gone", "flash", "text")
-
-
-def init_colors():
-    """Map color keys to curses attributes; monochrome fallback."""
-    attrs = {k: curses.A_NORMAL for k in COLOR_KEYS}
-    attrs["path"] = curses.A_BOLD
-    attrs["gone"] = curses.A_DIM
-    try:
-        curses.start_color()
-        curses.use_default_colors()
-        if not curses.has_colors():
-            return attrs
-        for i, (key, color) in enumerate([
-                ("time", curses.COLOR_CYAN),
-                ("running", curses.COLOR_YELLOW),
-                ("orphan", curses.COLOR_MAGENTA),
-                ("flash", curses.COLOR_RED)], start=1):
-            curses.init_pair(i, color, -1)
-            attrs[key] = curses.color_pair(i)
-    except curses.error:
-        pass
-    return attrs
-
-
-def _draw(stdscr, title, render_rows, sel, top, footer, footer_attr, attrs):
+def _draw(stdscr, *, attrs, footer, footer_attr, render_rows, sel, title, top):
     """render_rows: list of (spans, extra_attr). Returns new scroll `top`."""
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
@@ -281,7 +300,8 @@ def _draw(stdscr, title, render_rows, sel, top, footer, footer_attr, attrs):
     elif body > 0 and sel >= top + body:
         top = sel - body + 1
     try:
-        stdscr.addnstr(0, 0, truncate(title, maxx - 1), maxx - 1, curses.A_BOLD)
+        stdscr.addnstr(0, 0, truncate(title, width=maxx - 1), maxx - 1,
+                       curses.A_BOLD)
     except curses.error:
         pass
     for i, (spans, extra) in enumerate(render_rows[top:top + body]):
@@ -291,7 +311,7 @@ def _draw(stdscr, title, render_rows, sel, top, footer, footer_attr, attrs):
             avail = maxx - 1 - x
             if avail <= 0:
                 break
-            t = truncate(text, avail)
+            t = truncate(text, width=avail)
             try:
                 stdscr.addnstr(1 + i, x, t, avail, attrs.get(key, curses.A_NORMAL) | row_attr)
             except curses.error:
@@ -305,60 +325,76 @@ def _draw(stdscr, title, render_rows, sel, top, footer, footer_attr, attrs):
                 pass
     if maxy >= 2:
         try:
-            stdscr.addnstr(maxy - 1, 0, truncate(footer, maxx - 1), maxx - 1,
-                           footer_attr)
+            stdscr.addnstr(maxy - 1, 0, truncate(footer, width=maxx - 1),
+                           maxx - 1, footer_attr)
         except curses.error:
             pass
     stdscr.refresh()
     return top
 
 
-def _row_spans(row, now_ms, home):
-    """Render a flatten_rows row as [(text, colorkey)] spans.
-
-    Color keys: "time", "path", "running", "orphan", "gone", "text" — mapped
-    to curses attributes by init_colors().
-    """
-    if row["kind"] == "dir":
-        g = row["group"]
-        vis = row["vis_sessions"]
-        ts = vis[0]["ts"] if vis else g["last_ts"]
-        spans = [(f"{relative_time(ts, now_ms):>4}  ", "time"),
-                 (abbreviate_path(g["path"], home), "path")]
-        if row["busy"]:
-            spans.append((" [running]", "running"))
-        if row["cls"] == "orphan-worktree":
-            spans.append((" [worktree gone]", "orphan"))
-        elif row["cls"] == "gone":
-            spans.append((" [gone]", "gone"))
-        last = row["vis_sessions"][0]["display"] if row["vis_sessions"] else ""
-        if last:
-            spans.append((f"  —  {last}", "text"))
-        return spans
-    s = row["session"]
-    spans = [("    ", "text"),
-             (f"{relative_time(s['ts'], now_ms):>4}  ", "time"),
-             (s["display"] or "(no prompt)", "text")]
-    if row.get("running"):
-        spans.append((" [running]", "running"))
-    return spans
-
-
-AGE_WINDOWS = [("all", None), ("1mo", 30 * 86400_000), ("1w", 7 * 86400_000),
-               ("1d", 86400_000), ("1h", 3600_000)]
-HELP = ("↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
-        "^T age · type to filter · q quit")
-FLASH_BUSY = "that directory already has a claude session running"
-FLASH_GONE = "directory no longer exists"
-
-
-def _launch(row, session_id):
+def _launch(row, *, session_id):
     if row["cls"] == "orphan-worktree":
         return ("worktree", row["repo"], row["name"], session_id)
     return ("resume", row["group"]["path"], session_id)
 
 
-def run_picker(stdscr, groups, busy, running_ids):
+def init_colors():
+    """Map color keys to curses attributes; monochrome fallback."""
+    attrs = {k: curses.A_NORMAL for k in COLOR_KEYS}
+    attrs["gone"] = curses.A_DIM
+    attrs["path"] = curses.A_BOLD
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        if not curses.has_colors():
+            return attrs
+        for i, (key, color) in enumerate([
+                ("flash", curses.COLOR_RED),
+                ("orphan", curses.COLOR_MAGENTA),
+                ("running", curses.COLOR_YELLOW),
+                ("time", curses.COLOR_CYAN)], start=1):
+            curses.init_pair(i, color, -1)
+            attrs[key] = curses.color_pair(i)
+    except curses.error:
+        pass
+    return attrs
+
+
+def main():
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            entries = parse_history(f)
+    except OSError as e:
+        sys.exit(f"reclaude: cannot read {HISTORY_PATH}: {e}")
+    groups = group_by_home(entries, transcript_exists=transcript_exists)
+    if not groups:
+        sys.exit("reclaude: no resumable sessions found in history")
+    busy, running_ids = live_sessions()
+    if not sys.stdout.isatty():
+        sys.exit("reclaude: needs an interactive terminal")
+    os.environ.setdefault("ESCDELAY", "25")
+    result = curses.wrapper(lambda stdscr: run_picker(
+        stdscr, busy=busy, groups=groups, running_ids=running_ids))
+    if result is None:
+        return
+    if result[0] == "worktree":
+        _, path, name, session_id = result
+        argv = ["claude", "--worktree", name, "--resume", session_id]
+    else:
+        _, path, session_id = result
+        argv = ["claude", "--resume", session_id]
+    try:
+        os.chdir(path)
+    except OSError as e:
+        sys.exit(f"reclaude: cannot chdir to {path}: {e}")
+    try:
+        os.execvp("claude", argv)
+    except OSError as e:
+        sys.exit(f"reclaude: cannot exec claude: {e}")
+
+
+def run_picker(stdscr, *, busy, groups, running_ids):
     """Returns ('resume', path, id) | ('worktree', repo, name, id) | None."""
     try:
         curses.curs_set(0)
@@ -376,9 +412,11 @@ def run_picker(stdscr, groups, busy, running_ids):
         now_ms = int(time.time() * 1000)
         label, window = AGE_WINDOWS[age_idx]
         min_ts = now_ms - window if window is not None else None
-        rows = flatten_rows(groups, expanded, filt, home, busy, running_ids,
-                            show_missing=show_missing, min_ts=min_ts)
-        render = [(_row_spans(r, now_ms, home),
+        rows = flatten_rows(groups, busy=busy, expanded=expanded, filt=filt,
+                            home=home, min_ts=min_ts,
+                            running_ids=running_ids,
+                            show_missing=show_missing)
+        render = [(_row_spans(r, home=home, now_ms=now_ms),
                     curses.A_DIM if (r["busy"] or r["cls"] == "gone") else 0)
                   for r in rows]
         if flash:
@@ -394,24 +432,26 @@ def run_picker(stdscr, groups, busy, running_ids):
             title += f" · ≤{label}"
         if not show_missing:
             title += " · missing hidden"
-        top = _draw(stdscr, title, render, sel, top, footer, footer_attr, attrs)
+        top = _draw(stdscr, attrs=attrs, footer=footer,
+                    footer_attr=footer_attr, render_rows=render, sel=sel,
+                    title=title, top=top)
 
         key = stdscr.getch()
         if key == curses.KEY_UP:
             sel = max(0, sel - 1)
         elif key == curses.KEY_DOWN:
             sel = min(n - 1, sel + 1) if n else 0
-        elif key in (curses.KEY_ENTER, 10, 13) and n:
+        elif key in (10, 13, curses.KEY_ENTER) and n:
             r = rows[sel]
             if r["busy"]:
                 flash = FLASH_BUSY
             elif r["cls"] == "gone":
                 flash = FLASH_GONE
             elif r["kind"] == "session":
-                return _launch(r, r["session"]["session_id"])
+                return _launch(r, session_id=r["session"]["session_id"])
             else:
-                return _launch(r, r["vis_sessions"][0]["session_id"])
-        elif key in (curses.KEY_RIGHT, ord("\t")) and n:
+                return _launch(r, session_id=r["vis_sessions"][0]["session_id"])
+        elif key in (ord("\t"), curses.KEY_RIGHT) and n:
             if rows[sel]["kind"] == "dir":
                 expanded.add(rows[sel]["group"]["path"])
         elif key == curses.KEY_LEFT and n:
@@ -428,7 +468,7 @@ def run_picker(stdscr, groups, busy, running_ids):
                 filt, sel, top = "", 0, 0
             else:
                 return None
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
+        elif key in (8, 127, curses.KEY_BACKSPACE):
             if filt:
                 filt, sel, top = filt[:-1], 0, 0
         elif key == 23:  # Ctrl-W: toggle missing dirs
@@ -442,35 +482,3 @@ def run_picker(stdscr, groups, busy, running_ids):
             if ch == "q" and not filt:
                 return None
             filt, sel, top = filt + ch, 0, 0
-
-
-def main():
-    try:
-        with open(HISTORY_PATH, encoding="utf-8") as f:
-            entries = parse_history(f)
-    except OSError as e:
-        sys.exit(f"reclaude: cannot read {HISTORY_PATH}: {e}")
-    groups = group_by_home(entries)
-    if not groups:
-        sys.exit("reclaude: no resumable sessions found in history")
-    busy, running_ids = live_sessions()
-    if not sys.stdout.isatty():
-        sys.exit("reclaude: needs an interactive terminal")
-    os.environ.setdefault("ESCDELAY", "25")
-    result = curses.wrapper(run_picker, groups, busy, running_ids)
-    if result is None:
-        return
-    if result[0] == "worktree":
-        _, path, name, session_id = result
-        argv = ["claude", "--worktree", name, "--resume", session_id]
-    else:
-        _, path, session_id = result
-        argv = ["claude", "--resume", session_id]
-    try:
-        os.chdir(path)
-    except OSError as e:
-        sys.exit(f"reclaude: cannot chdir to {path}: {e}")
-    try:
-        os.execvp("claude", argv)
-    except OSError as e:
-        sys.exit(f"reclaude: cannot exec claude: {e}")
