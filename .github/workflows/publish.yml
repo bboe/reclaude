@@ -1,10 +1,3 @@
-name: publish
-
-on:
-  push:
-    tags:
-      - "v*"
-
 jobs:
   publish:
     environment: pypi
@@ -20,3 +13,10 @@ jobs:
 
   test:
     uses: ./.github/workflows/ci.yml
+
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
