@@ -233,6 +233,7 @@ source = { editable = "." }
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -241,6 +242,7 @@ dev = [
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pyyaml" },
 ]
 
 [[package]]

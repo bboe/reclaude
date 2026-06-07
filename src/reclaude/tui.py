@@ -1,124 +1,219 @@
 """Curses layer: colors, drawing, the picker event loop, and main()."""
+
+from __future__ import annotations
+
+import contextlib
 import curses
+import dataclasses
 import os
 import sys
 import time
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from reclaude.core import (_row_spans, flatten_rows, group_by_home,
-                           live_sessions, parse_history, transcript_exists,
-                           truncate)
+from reclaude.core import (
+    RowFilter,
+    _row_spans,
+    flatten_rows,
+    group_by_home,
+    live_sessions,
+    parse_history,
+    transcript_exists,
+    truncate,
+)
+
+if TYPE_CHECKING:
+    from typing import NoReturn
+
+    from reclaude.core import DirRow, Group, SessionRow
 
 # AGE_WINDOWS is in Ctrl-T cycle order (coarsest to finest), not sorted.
-AGE_WINDOWS = [("all", None), ("1mo", 30 * 86400_000), ("1w", 7 * 86400_000),
-               ("1d", 86400_000), ("1h", 3600_000)]
+AGE_WINDOWS = [
+    ("all", None),
+    ("1mo", 30 * 86400_000),
+    ("1w", 7 * 86400_000),
+    ("1d", 86400_000),
+    ("1h", 3600_000),
+]
 # COLOR_KEYS must cover every key that core._row_spans emits.
 COLOR_KEYS = ("flash", "gone", "orphan", "path", "running", "text", "time")
 FLASH_BUSY = "that directory already has a claude session running"
 FLASH_GONE = "directory no longer exists"
-HELP = ("↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
-        "^T age · type to filter · q quit")
-HISTORY_PATH = os.path.expanduser("~/.claude/history.jsonl")
+HELP = (
+    "↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
+    "^T age · type to filter · q quit"
+)
+HISTORY_PATH = Path("~/.claude/history.jsonl").expanduser()
+_BACKSPACE_KEYS = frozenset({8, 127, curses.KEY_BACKSPACE})
+_ENTER_KEYS = frozenset({10, 13, curses.KEY_ENTER})
+_EXPAND_KEYS = frozenset({ord("\t"), curses.KEY_RIGHT})
+_KEY_CTRL_T = 20
+_KEY_CTRL_W = 23
+_KEY_ESCAPE = 27
+_MIN_ROWS_WITH_FOOTER = 2
+_PRINTABLE_KEYS = range(32, 127)
 
 
-def _die(message):
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _Frame:
+    """Everything _draw needs to paint one screenful."""
+
+    footer: str
+    footer_attr: int
+    render_rows: list[tuple[list[tuple[str, str]], int]]
+    scroll_top: int
+    selection: int
+    title: str
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _PickerContext:
+    """Inputs that stay fixed for the lifetime of one picker run."""
+
+    attrs: dict[str, int]
+    busy: set[str]
+    groups: list[Group]
+    home: str
+    running_ids: set[str]
+
+
+@dataclasses.dataclass(kw_only=True)
+class _PickerState:
+    """Mutable UI state for one picker run."""
+
+    age_index: int = 0
+    expanded: set[str] = dataclasses.field(default_factory=set)
+    filter_text: str = ""
+    flash: str = ""
+    scroll_top: int = 0
+    selection: int = 0
+    show_missing: bool = True
+
+
+def _build_frame(
+    *,
+    context: _PickerContext,
+    now_ms: float,
+    rows: list[DirRow | SessionRow],
+    state: _PickerState,
+) -> _Frame:
+    """Assemble the next frame from the visible rows and UI state.
+
+    Consumes state.flash: a pending flash message becomes this frame's
+    footer, then clears.
+
+    Returns:
+        The frame for _draw.
+
+    """
+    render_rows = [
+        (
+            _row_spans(row, home=context.home, now_ms=now_ms),
+            curses.A_DIM if (row["busy"] or row["cls"] == "gone") else 0,
+        )
+        for row in rows
+    ]
+    if state.flash:
+        footer, footer_attr = state.flash, context.attrs["flash"]
+        state.flash = ""
+    elif state.filter_text:
+        footer, footer_attr = f"filter: {state.filter_text}▏", curses.A_DIM
+    else:
+        footer, footer_attr = HELP, curses.A_DIM
+    title = "reclaude — recent sessions"
+    label, window = AGE_WINDOWS[state.age_index]
+    if window is not None:
+        title += f" · ≤{label}"
+    if not state.show_missing:
+        title += " · missing hidden"
+    return _Frame(
+        footer=footer,
+        footer_attr=footer_attr,
+        render_rows=render_rows,
+        scroll_top=state.scroll_top,
+        selection=state.selection,
+        title=title,
+    )
+
+
+def _collapse_row(*, rows: list[DirRow | SessionRow], state: _PickerState) -> None:
+    """Collapse the selected dir, or jump from a session row to its dir."""
+    row = rows[state.selection]
+    if row["kind"] == "session":
+        for index in range(state.selection - 1, -1, -1):
+            if rows[index]["kind"] == "dir" and rows[index]["group"] is row["group"]:
+                state.selection = index
+                break
+    else:
+        state.expanded.discard(row["group"]["path"])
+
+
+def _die(message: str, /) -> NoReturn:
     """Print an error to stderr and exit non-zero."""
-    print(f"reclaude: {message}", file=sys.stderr)
+    sys.stderr.write(f"reclaude: {message}\n")
     sys.exit(1)
 
 
-def _draw(stdscr, *, attrs, footer, footer_attr, render_rows, scroll_top,
-          selection, title):
-    """render_rows: list of (spans, extra_attr). Returns new scroll `top`."""
+def _draw(stdscr: curses.window, /, *, attrs: dict[str, int], frame: _Frame) -> int:
+    """Paint the frame: title, span rows with selection bar, footer.
+
+    Returns:
+        The new scroll offset after keeping the selection visible.
+
+    """
     stdscr.erase()
     maxy, maxx = stdscr.getmaxyx()
     # maxy==1: header only; maxy==2: header (y=0) + footer (y=1), no body rows.
     body = max(0, maxy - 2)
-    if selection < scroll_top:
-        scroll_top = selection
-    elif body > 0 and selection >= scroll_top + body:
-        scroll_top = selection - body + 1
-    try:
-        stdscr.addnstr(0, 0, truncate(title, width=maxx - 1), maxx - 1,
-                       curses.A_BOLD)
-    except curses.error:
-        pass
-    visible = render_rows[scroll_top:scroll_top + body]
-    for i, (spans, extra_attr) in enumerate(visible):
-        row_attr = extra_attr | (curses.A_REVERSE
-                                 if scroll_top + i == selection else 0)
+    scroll_top = frame.scroll_top
+    if frame.selection < scroll_top:
+        scroll_top = frame.selection
+    elif body > 0 and frame.selection >= scroll_top + body:
+        scroll_top = frame.selection - body + 1
+    with contextlib.suppress(curses.error):
+        stdscr.addnstr(
+            0, 0, truncate(frame.title, width=maxx - 1), maxx - 1, curses.A_BOLD
+        )
+    visible = frame.render_rows[scroll_top : scroll_top + body]
+    for index, (spans, extra_attr) in enumerate(visible):
+        row_attr = extra_attr | (
+            curses.A_REVERSE if scroll_top + index == frame.selection else 0
+        )
         x = 0
         for text, key in spans:
             avail = maxx - 1 - x
             if avail <= 0:
                 break
             clipped = truncate(text, width=avail)
-            try:
-                stdscr.addnstr(1 + i, x, clipped, avail,
-                               attrs.get(key, curses.A_NORMAL) | row_attr)
-            except curses.error:
-                pass
+            with contextlib.suppress(curses.error):
+                stdscr.addnstr(
+                    1 + index,
+                    x,
+                    clipped,
+                    avail,
+                    attrs.get(key, curses.A_NORMAL) | row_attr,
+                )
             x += len(clipped)
         if x < maxx - 1:  # pad so the selection bar spans the line
-            try:
-                stdscr.addnstr(1 + i, x, " " * (maxx - 1 - x), maxx - 1 - x,
-                               row_attr)
-            except curses.error:
-                pass
-    if maxy >= 2:
-        try:
-            stdscr.addnstr(maxy - 1, 0, truncate(footer, width=maxx - 1),
-                           maxx - 1, footer_attr)
-        except curses.error:
-            pass
+            with contextlib.suppress(curses.error):
+                stdscr.addnstr(
+                    1 + index, x, " " * (maxx - 1 - x), maxx - 1 - x, row_attr
+                )
+    if maxy >= _MIN_ROWS_WITH_FOOTER:
+        with contextlib.suppress(curses.error):
+            stdscr.addnstr(
+                maxy - 1,
+                0,
+                truncate(frame.footer, width=maxx - 1),
+                maxx - 1,
+                frame.footer_attr,
+            )
     stdscr.refresh()
     return scroll_top
 
 
-def _launch(row, *, session_id):
-    if row["cls"] == "orphan-worktree":
-        return ("worktree", row["repo"], row["name"], session_id)
-    return ("resume", row["group"]["path"], session_id)
-
-
-def init_colors():
-    """Map color keys to curses attributes; monochrome fallback."""
-    attrs = {key: curses.A_NORMAL for key in COLOR_KEYS}
-    attrs["gone"] = curses.A_DIM
-    attrs["path"] = curses.A_BOLD
-    try:
-        curses.start_color()
-        curses.use_default_colors()
-        if not curses.has_colors():
-            return attrs
-        for i, (key, color) in enumerate([
-                ("flash", curses.COLOR_RED),
-                ("orphan", curses.COLOR_MAGENTA),
-                ("running", curses.COLOR_YELLOW),
-                ("time", curses.COLOR_CYAN)], start=1):
-            curses.init_pair(i, color, -1)
-            attrs[key] = curses.color_pair(i)
-    except curses.error:
-        pass
-    return attrs
-
-
-def main():
-    try:
-        with open(HISTORY_PATH, encoding="utf-8") as file:
-            entries = parse_history(file)
-    except OSError as error:
-        _die(f"cannot read {HISTORY_PATH}: {error}")
-    groups = group_by_home(entries, transcript_exists=transcript_exists)
-    if not groups:
-        _die("no resumable sessions found in history")
-    busy, running_ids = live_sessions()
-    if not sys.stdout.isatty():
-        _die("needs an interactive terminal")
-    os.environ.setdefault("ESCDELAY", "25")
-    result = curses.wrapper(lambda stdscr: run_picker(
-        stdscr, busy=busy, groups=groups, running_ids=running_ids))
-    if result is None:
-        return
+def _exec_claude(*, result: tuple[str, ...]) -> NoReturn:
+    """Chdir to the picked directory and exec claude on the picked session."""
     if result[0] == "worktree":
         _, path, name, session_id = result
         argv = ["claude", "--worktree", name, "--resume", session_id]
@@ -133,100 +228,234 @@ def main():
     except OSError as error:
         _die(f"cannot chdir to {path}: {error}")
     try:
-        os.execvp("claude", argv)
+        # exec'ing claude from PATH is this program's entire purpose.
+        os.execvp("claude", argv)  # noqa: S606, S607
     except OSError as error:
         _die(f"cannot exec claude: {error}")
 
 
-def run_picker(stdscr, *, busy, groups, running_ids):
-    """Returns ('resume', path, id) | ('worktree', repo, name, id) | None."""
+def _handle_filter_key(key: int, /, *, state: _PickerState) -> bool:
+    """Apply a filter/toggle key (Esc, backspace, ^W, ^T, printable) to state.
+
+    Returns:
+        True when the picker should quit (Esc or q with an empty filter).
+
+    """
+    if key == _KEY_ESCAPE:
+        if not state.filter_text:
+            return True
+        state.filter_text = ""
+        _reset_scroll(state=state)
+    elif key in _BACKSPACE_KEYS:
+        if state.filter_text:
+            state.filter_text = state.filter_text[:-1]
+            _reset_scroll(state=state)
+    elif key == _KEY_CTRL_W:  # toggle missing dirs
+        state.show_missing = not state.show_missing
+        _reset_scroll(state=state)
+    elif key == _KEY_CTRL_T:  # cycle age filter
+        state.age_index = (state.age_index + 1) % len(AGE_WINDOWS)
+        _reset_scroll(state=state)
+    elif key in _PRINTABLE_KEYS:
+        character = chr(key)
+        if character == "q" and not state.filter_text:
+            return True
+        state.filter_text += character
+        _reset_scroll(state=state)
+    return False
+
+
+def _handle_nav_key(
+    key: int, /, *, rows: list[DirRow | SessionRow], state: _PickerState
+) -> tuple[str, ...] | None:
+    """Apply a navigation key (arrows, enter, tab) to state.
+
+    Returns:
+        A launch tuple when enter resumes a session, else None.
+
+    """
+    if key == curses.KEY_UP:
+        state.selection = max(0, state.selection - 1)
+    elif key == curses.KEY_DOWN and rows:
+        state.selection = min(len(rows) - 1, state.selection + 1)
+    elif key in _ENTER_KEYS and rows:
+        return _select_row(rows=rows, state=state)
+    elif key in _EXPAND_KEYS and rows:
+        if rows[state.selection]["kind"] == "dir":
+            state.expanded.add(rows[state.selection]["group"]["path"])
+    elif key == curses.KEY_LEFT and rows:
+        _collapse_row(rows=rows, state=state)
+    return None
+
+
+def _launch(*, row: DirRow | SessionRow, session_id: str) -> tuple[str, ...]:
+    """Build the launch tuple for a row's session.
+
+    Returns:
+        ("worktree", repo, name, id) for orphaned worktrees, else
+        ("resume", path, id).
+
+    """
+    if row["cls"] == "orphan-worktree":
+        return ("worktree", row["repo"], row["name"], session_id)
+    return ("resume", row["group"]["path"], session_id)
+
+
+def _load_groups() -> list[Group]:
+    """Read history.jsonl and group resumable sessions by home directory.
+
+    Returns:
+        The non-empty group list; exits with an error otherwise.
+
+    """
     try:
-        curses.curs_set(0)
+        with HISTORY_PATH.open(encoding="utf-8") as file:
+            entries = parse_history(file)
+    except OSError as error:
+        _die(f"cannot read {HISTORY_PATH}: {error}")
+    groups = group_by_home(entries=entries, transcript_exists=transcript_exists)
+    if not groups:
+        _die("no resumable sessions found in history")
+    return groups
+
+
+def _reset_scroll(*, state: _PickerState) -> None:
+    """Reset the selection and scroll offset after the row list changed."""
+    state.scroll_top = 0
+    state.selection = 0
+
+
+def _select_row(
+    *, rows: list[DirRow | SessionRow], state: _PickerState
+) -> tuple[str, ...] | None:
+    """Resolve enter on the selected row.
+
+    Returns:
+        The launch tuple for the selected session (a dir row launches its
+        newest visible session — display = action), or None with a flash set
+        when the row is busy or gone.
+
+    """
+    row = rows[state.selection]
+    if row["busy"]:
+        state.flash = FLASH_BUSY
+    elif row["cls"] == "gone":
+        state.flash = FLASH_GONE
+    elif row["kind"] == "session":
+        return _launch(row=row, session_id=row["session"]["session_id"])
+    else:
+        return _launch(row=row, session_id=row["vis_sessions"][0]["session_id"])
+    return None
+
+
+def _visible_rows(
+    *, context: _PickerContext, now_ms: float, state: _PickerState
+) -> list[DirRow | SessionRow]:
+    """Compute the currently visible rows for the picker state.
+
+    Returns:
+        The flatten_rows result for the current filter, age window, and
+        expansion state.
+
+    """
+    _, window = AGE_WINDOWS[state.age_index]
+    min_ts = now_ms - window if window is not None else None
+    return flatten_rows(
+        criteria=RowFilter(
+            busy=context.busy,
+            expanded=state.expanded,
+            filter_text=state.filter_text,
+            home=context.home,
+            min_ts=min_ts,
+            running_ids=context.running_ids,
+            show_missing=state.show_missing,
+        ),
+        groups=context.groups,
+    )
+
+
+def init_colors() -> dict[str, int]:
+    """Map color keys to curses attributes; monochrome fallback.
+
+    Returns:
+        A curses attribute per COLOR_KEYS entry.
+
+    """
+    attrs = dict.fromkeys(COLOR_KEYS, curses.A_NORMAL)
+    attrs["gone"] = curses.A_DIM
+    attrs["path"] = curses.A_BOLD
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        if not curses.has_colors():
+            return attrs
+        for index, (key, color) in enumerate(
+            [
+                ("flash", curses.COLOR_RED),
+                ("orphan", curses.COLOR_MAGENTA),
+                ("running", curses.COLOR_YELLOW),
+                ("time", curses.COLOR_CYAN),
+            ],
+            start=1,
+        ):
+            curses.init_pair(index, color, -1)
+            attrs[key] = curses.color_pair(index)
     except curses.error:
         pass
-    stdscr.keypad(True)
-    attrs = init_colors()
-    home = os.path.expanduser("~")
+    return attrs
 
-    selection, scroll_top, filter_text, flash = 0, 0, "", ""
-    show_missing, age_index = True, 0
-    expanded = set()
 
+def main() -> None:
+    """Pick a recent Claude Code session and exec claude on it."""
+    groups = _load_groups()
+    busy, running_ids = live_sessions()
+    if not sys.stdout.isatty():
+        _die("needs an interactive terminal")
+    os.environ.setdefault("ESCDELAY", "25")
+    result = curses.wrapper(
+        lambda stdscr: run_picker(
+            stdscr, busy=busy, groups=groups, running_ids=running_ids
+        )
+    )
+    if result is None:
+        return
+    _exec_claude(result=result)
+
+
+def run_picker(
+    stdscr: curses.window,
+    /,
+    *,
+    busy: set[str],
+    groups: list[Group],
+    running_ids: set[str],
+) -> tuple[str, ...] | None:
+    """Run the picker event loop.
+
+    Returns:
+        ('resume', path, id) | ('worktree', repo, name, id) | None.
+
+    """
+    with contextlib.suppress(curses.error):
+        curses.curs_set(0)
+    stdscr.keypad(True)  # noqa: FBT003 — the curses API is positional-only
+    context = _PickerContext(
+        attrs=init_colors(),
+        busy=busy,
+        groups=groups,
+        home=str(Path.home()),
+        running_ids=running_ids,
+    )
+    state = _PickerState()
     while True:
         now_ms = int(time.time() * 1000)
-        label, window = AGE_WINDOWS[age_index]
-        min_ts = now_ms - window if window is not None else None
-        rows = flatten_rows(groups, busy=busy, expanded=expanded,
-                            filter_text=filter_text, home=home,
-                            min_ts=min_ts, running_ids=running_ids,
-                            show_missing=show_missing)
-        render = [(_row_spans(row, home=home, now_ms=now_ms),
-                    curses.A_DIM if (row["busy"] or row["cls"] == "gone")
-                    else 0)
-                  for row in rows]
-        if flash:
-            footer, footer_attr, flash = flash, attrs["flash"], ""
-        elif filter_text:
-            footer, footer_attr = f"filter: {filter_text}▏", curses.A_DIM
-        else:
-            footer, footer_attr = HELP, curses.A_DIM
-        num_rows = len(rows)
-        selection = max(0, min(selection, num_rows - 1)) if num_rows else 0
-        title = "reclaude — recent sessions"
-        if window is not None:
-            title += f" · ≤{label}"
-        if not show_missing:
-            title += " · missing hidden"
-        scroll_top = _draw(stdscr, attrs=attrs, footer=footer,
-                           footer_attr=footer_attr, render_rows=render,
-                           scroll_top=scroll_top, selection=selection,
-                           title=title)
-
+        rows = _visible_rows(context=context, now_ms=now_ms, state=state)
+        state.selection = min(state.selection, len(rows) - 1) if rows else 0
+        frame = _build_frame(context=context, now_ms=now_ms, rows=rows, state=state)
+        state.scroll_top = _draw(stdscr, attrs=context.attrs, frame=frame)
         key = stdscr.getch()
-        if key == curses.KEY_UP:
-            selection = max(0, selection - 1)
-        elif key == curses.KEY_DOWN:
-            selection = min(num_rows - 1, selection + 1) if num_rows else 0
-        elif key in (10, 13, curses.KEY_ENTER) and num_rows:
-            row = rows[selection]
-            if row["busy"]:
-                flash = FLASH_BUSY
-            elif row["cls"] == "gone":
-                flash = FLASH_GONE
-            elif row["kind"] == "session":
-                return _launch(row, session_id=row["session"]["session_id"])
-            else:
-                return _launch(
-                    row, session_id=row["vis_sessions"][0]["session_id"])
-        elif key in (ord("\t"), curses.KEY_RIGHT) and num_rows:
-            if rows[selection]["kind"] == "dir":
-                expanded.add(rows[selection]["group"]["path"])
-        elif key == curses.KEY_LEFT and num_rows:
-            row = rows[selection]
-            if row["kind"] == "session":
-                for i in range(selection - 1, -1, -1):
-                    if (rows[i]["kind"] == "dir"
-                            and rows[i]["group"] is row["group"]):
-                        selection = i
-                        break
-            else:
-                expanded.discard(row["group"]["path"])
-        elif key == 27:  # Esc
-            if filter_text:
-                filter_text, selection, scroll_top = "", 0, 0
-            else:
-                return None
-        elif key in (8, 127, curses.KEY_BACKSPACE):
-            if filter_text:
-                filter_text, selection, scroll_top = filter_text[:-1], 0, 0
-        elif key == 23:  # Ctrl-W: toggle missing dirs
-            show_missing = not show_missing
-            selection, scroll_top = 0, 0
-        elif key == 20:  # Ctrl-T: cycle age filter
-            age_index = (age_index + 1) % len(AGE_WINDOWS)
-            selection, scroll_top = 0, 0
-        elif 32 <= key < 127:
-            character = chr(key)
-            if character == "q" and not filter_text:
-                return None
-            filter_text, selection, scroll_top = filter_text + character, 0, 0
+        launch = _handle_nav_key(key, rows=rows, state=state)
+        if launch is not None:
+            return launch
+        if _handle_filter_key(key, state=state):
+            return None
