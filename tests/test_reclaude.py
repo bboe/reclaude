@@ -164,7 +164,10 @@ def test_flatten_rows_show_missing_and_min_ts():
     orphan = _group("/r/.claude/worktrees/w1",
                     sessions=[_session("s2", ts=4000)])
     gone = _group("/gone/x", sessions=[_session("s3", ts=3000)])
-    isdir = lambda path: path in ("/p/live", "/r")
+
+    def isdir(path):
+        return path in ("/p/live", "/r")
+
     rows = core.flatten_rows([live, orphan, gone], busy=set(), expanded=set(),
                              filter_text="", home="/h", isdir=isdir,
                              running_ids=set(), show_missing=False)
