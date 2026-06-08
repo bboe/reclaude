@@ -1,5 +1,6 @@
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 from reclaude import core
@@ -27,6 +28,21 @@ def _fake_proc(*, comm: str, cwd_target: Path, pid: int, tmp_path: Path) -> None
     proc_entry.mkdir()
     (proc_entry / "comm").write_text(comm + "\n")
     (proc_entry / "cwd").symlink_to(cwd_target)
+
+
+def _fake_run(*, processes: dict[str, dict[str, str]]) -> Callable[[list[str]], str]:
+    # Stand in for the real ps/lsof runner, backed by a {pid: {comm, cwd}} table.
+    def run(command: list[str], /) -> str:
+        if command[:2] == ["ps", "-axo"]:
+            return "".join(
+                f"  {pid} {info['comm']}\n" for pid, info in processes.items()
+            )
+        if command[0] == "ps":  # ps -o comm= -p <pid>: empty once the pid is gone
+            return processes.get(command[-1], {}).get("comm", "")
+        cwd = processes.get(command[-1], {}).get("cwd", "")  # lsof -Fn -p <pid>
+        return f"p{command[-1]}\nfcwd\nn{cwd}\n" if cwd else ""
+
+    return run
 
 
 def _fake_session_file(*, cwd: Path, dirpath: Path, pid: int, session_id: str) -> None:
@@ -91,6 +107,20 @@ def test_find_busy_dirs(*, tmp_path: Path) -> None:
 
 def test_find_busy_dirs_missing_proc_root() -> None:
     assert core.find_busy_dirs(proc_root="/nonexistent-proc") == set()
+
+
+def test_find_busy_dirs_ps_backend(*, tmp_path: Path) -> None:
+    # proc_root=None routes the scan through ps + lsof (macOS / no /proc).
+    live = tmp_path / "live"
+    live.mkdir()
+    run = _fake_run(
+        processes={
+            "100": {"comm": "/opt/claude/versions/2.1.0", "cwd": str(live)},
+            "200": {"comm": "vim", "cwd": str(tmp_path)},  # not claude
+            "300": {"comm": "/u/.local/bin/reclaude", "cwd": str(tmp_path)},  # not it
+        }
+    )
+    assert core.find_busy_dirs(proc_root=None, run=run) == {os.path.realpath(str(live))}
 
 
 def test_flatten_rows_age_filters_sessions_and_dir() -> None:
@@ -338,6 +368,28 @@ def test_live_sessions_fallback_to_proc_scan(*, tmp_path: Path) -> None:
     )
     assert busy == {os.path.realpath(str(work))}
     assert running == set()
+
+
+def test_live_sessions_ps_backend(*, tmp_path: Path) -> None:
+    # proc_root=None validates each record's pid via ps; cwd stays the record's.
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    _fake_session_file(cwd=work, dirpath=sessions_dir, pid=100, session_id="s-live")
+    _fake_session_file(cwd=work, dirpath=sessions_dir, pid=200, session_id="s-stale")
+    _fake_session_file(cwd=work, dirpath=sessions_dir, pid=300, session_id="s-vim")
+    run = _fake_run(
+        processes={
+            "100": {"comm": "/opt/claude/versions/2.1.0", "cwd": str(work)},
+            "300": {"comm": "vim", "cwd": str(work)},  # alive, but not claude
+        }  # pid 200 absent: stale record, process gone
+    )
+    busy, running = core.live_sessions(
+        proc_root=None, run=run, sessions_dir=str(sessions_dir)
+    )
+    assert busy == {os.path.realpath(str(work))}
+    assert running == {"s-live"}
 
 
 def test_mung_path() -> None:

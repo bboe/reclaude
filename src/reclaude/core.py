@@ -7,6 +7,12 @@ import dataclasses
 import json
 import os
 import re
+import shutil
+
+# subprocess only ever runs ps/lsof with a fixed argv (never a shell), to read
+# another process's identity and cwd on POSIX systems without /proc (macOS/BSD).
+import subprocess  # noqa: S404
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -16,6 +22,9 @@ if TYPE_CHECKING:
 MAX_DIRS = 30
 MS_PER_DAY = 86_400_000
 MS_PER_HOUR = 3_600_000
+# /proc is read directly on Linux; None routes liveness/cwd through ps + lsof
+# (macOS and other POSIX without /proc). Selected once, here, by platform.
+PROC_ROOT = "/proc" if sys.platform == "linux" else None
 PROJECTS_DIR = Path("~/.claude/projects").expanduser()
 SECONDS_PER_DAY = MS_PER_DAY // 1000
 SECONDS_PER_HOUR = MS_PER_HOUR // 1000
@@ -122,21 +131,34 @@ class SessionRow(BaseRow):
     session: Session
 
 
-def _is_claude_pid(*, pid: int | str, proc_root: str) -> bool:
-    """Check proc_root/<pid>/comm for a running `claude` process.
+def _is_claude_pid(
+    *, pid: int | str, proc_root: str | None, run: Callable[[list[str]], str]
+) -> bool:
+    """Check whether pid is a live `claude` process.
+
+    Reads proc_root/<pid>/comm when proc_root is set (Linux); otherwise asks
+    `ps` for the process's exec path (macOS and other POSIX without /proc),
+    which also reports liveness (empty output once the pid is gone).
 
     Returns:
-        Whether the pid belongs to a live process named "claude".
+        Whether the pid belongs to a live process running claude.
 
     """
+    if proc_root is None:
+        return _looks_like_claude(run(["ps", "-o", "comm=", "-p", str(pid)]))
     comm = ""
     with contextlib.suppress(OSError):
         comm = (Path(proc_root) / str(pid) / "comm").read_text(encoding="utf-8")
-    return comm.strip() == "claude"
+    return _looks_like_claude(comm)
 
 
-def _live_record(*, proc_root: str, record_path: Path) -> tuple[str, str | None] | None:
-    """Validate one ~/.claude/sessions record against /proc.
+def _live_record(
+    *, proc_root: str | None, record_path: Path, run: Callable[[list[str]], str]
+) -> tuple[str, str | None] | None:
+    """Validate one ~/.claude/sessions record against the running process.
+
+    The record carries the cwd, so only liveness needs checking — via /proc
+    (Linux) or `ps` (elsewhere), per proc_root.
 
     Returns:
         (realpath cwd, session id or None) when the record describes a live
@@ -154,9 +176,84 @@ def _live_record(*, proc_root: str, record_path: Path) -> tuple[str, str | None]
     session_id = record.get("sessionId")
     if not (isinstance(pid, int) and isinstance(cwd, str)):
         return None
-    if not _is_claude_pid(pid=pid, proc_root=proc_root):
+    if not _is_claude_pid(pid=pid, proc_root=proc_root, run=run):
         return None
     return (os.path.realpath(cwd), session_id if isinstance(session_id, str) else None)
+
+
+def _looks_like_claude(name: str, /) -> bool:
+    """Return whether a process comm or exec path denotes a running claude.
+
+    Linux /proc/<pid>/comm is the literal "claude"; macOS `ps -o comm=` is the
+    versioned binary path (.../claude/versions/<version>). Match both without
+    matching reclaude itself (whose name merely contains "claude").
+
+    Returns:
+        Whether the name denotes a claude process.
+
+    """
+    name = name.strip()
+    return name == "claude" or name.endswith("/claude") or "/claude/versions/" in name
+
+
+def _process_cwd(*, pid: str, run: Callable[[list[str]], str]) -> str:
+    """Return a process's working directory via lsof (used where /proc is absent).
+
+    Returns:
+        The realpath cwd, or "" when lsof is unavailable or reports nothing.
+
+    """
+    for line in run(["lsof", "-a", "-d", "cwd", "-Fn", "-p", str(pid)]).splitlines():
+        if line.startswith("n"):
+            return os.path.realpath(line[1:])
+    return ""
+
+
+def _run_command(command: list[str], /) -> str:
+    """Run command and return its stdout, swallowing every failure.
+
+    The executable is resolved through PATH first so the argv stays a fixed
+    list of literals (plus an int-derived pid) — never a shell string.
+
+    Returns:
+        Captured stdout, or "" if the command is missing, errors, or times out.
+
+    """
+    executable = shutil.which(command[0])
+    if executable is None:
+        return ""
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [executable, *command[1:]],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout
+
+
+def _scan_busy_dirs(*, run: Callable[[list[str]], str]) -> set[str]:
+    """Find busy dirs by scanning `ps` for claude processes (the /proc-less path).
+
+    Returns:
+        Realpath cwds of running claude processes, discovered via ps + lsof.
+
+    """
+    busy: set[str] = set()
+    for line in run(["ps", "-axo", "pid=,comm="]).splitlines():
+        try:
+            pid, comm = line.split(maxsplit=1)
+        except ValueError:
+            continue
+        if not (pid.isdigit() and _looks_like_claude(comm)):
+            continue
+        cwd = _process_cwd(pid=pid, run=run)
+        if cwd:
+            busy.add(cwd)
+    return busy
 
 
 def abbreviate_path(path: str, /, *, home: str) -> str:
@@ -210,13 +307,22 @@ def classify_dir(
     return Classification(kind="gone")
 
 
-def find_busy_dirs(*, proc_root: str = "/proc") -> set[str]:
-    """Scan proc_root for running `claude` processes.
+def find_busy_dirs(
+    *,
+    proc_root: str | None = PROC_ROOT,
+    run: Callable[[list[str]], str] = _run_command,
+) -> set[str]:
+    """Find dirs with a running `claude`, scanning /proc or falling back to ps.
+
+    With proc_root set (Linux) the scan reads /proc directly; with proc_root
+    None (macOS and other POSIX without /proc) it delegates to ps + lsof.
 
     Returns:
         The set of realpath cwds of running `claude` processes.
 
     """
+    if proc_root is None:
+        return _scan_busy_dirs(run=run)
     busy: set[str] = set()
     try:
         proc_entries = list(Path(proc_root).iterdir())
@@ -225,7 +331,7 @@ def find_busy_dirs(*, proc_root: str = "/proc") -> set[str]:
     for proc_entry in proc_entries:
         if not proc_entry.name.isdigit():
             continue
-        if not _is_claude_pid(pid=proc_entry.name, proc_root=proc_root):
+        if not _is_claude_pid(pid=proc_entry.name, proc_root=proc_root, run=run):
             continue
         with contextlib.suppress(OSError):  # process exited, or not ours to read
             busy.add(os.path.realpath(proc_entry / "cwd"))
@@ -335,14 +441,18 @@ def group_by_home(
 
 
 def live_sessions(
-    *, proc_root: str = "/proc", sessions_dir: str | None = None
+    *,
+    proc_root: str | None = PROC_ROOT,
+    run: Callable[[list[str]], str] = _run_command,
+    sessions_dir: str | None = None,
 ) -> tuple[set[str], set[str]]:
     """Busy dirs and running session ids from ~/.claude/sessions records.
 
-    Each <pid>.json record counts only if /proc/<pid>/comm is "claude" (stale
-    files survive crashes). Falls back to scanning /proc when the records
-    yield nothing, so a claude started outside the session tracker still
-    locks its directory (running ids unknown in that case).
+    Each <pid>.json record counts only if its pid is a live claude — validated
+    against /proc/<pid>/comm on Linux, or `ps` where /proc is absent (stale
+    files survive crashes). Falls back to scanning every process when the
+    records yield nothing, so a claude started outside the session tracker
+    still locks its directory (running ids unknown in that case).
 
     Returns:
         (busy, running): realpath cwds of live claude processes, and their
@@ -357,7 +467,7 @@ def live_sessions(
     except OSError:
         record_paths = []
     for record_path in record_paths:
-        live = _live_record(proc_root=proc_root, record_path=record_path)
+        live = _live_record(proc_root=proc_root, record_path=record_path, run=run)
         if live is None:
             continue
         cwd, session_id = live
@@ -365,7 +475,7 @@ def live_sessions(
         if session_id is not None:
             running.add(session_id)
     if not busy:
-        busy = find_busy_dirs(proc_root=proc_root)
+        busy = find_busy_dirs(proc_root=proc_root, run=run)
     return busy, running
 
 
