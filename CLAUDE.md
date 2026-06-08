@@ -38,7 +38,7 @@ Data flow: `history.jsonl` → entries → groups (sessions attributed to their 
 
 ## Empirically verified Claude Code facts (the whole design rests on these)
 
-- `claude --resume <id>` / `--continue` only find transcripts under `~/.claude/projects/<munged-cwd>/` for the **current** directory. Munging: `/` and `.` → `-` (deterministic; un-munging is ambiguous — only ever mung).
+- `claude --resume <id>` / `--continue` only find transcripts under `~/.claude/projects/<munged-cwd>/` for the **current** directory. Munging: `/`, `.`, and `_` → `-` (deterministic; un-munging is ambiguous — only ever mung).
 - A session's transcript lives under the directory the session **started** in and never moves, even if the session later changed cwd (EnterWorktree etc.). Hence `group_by_home`: first project in history = the only resumable location.
 - Deleted worktree sessions resurrect via `cd <repo> && claude --worktree <name> --resume <id>` — claude recreates `<repo>/.claude/worktrees/<name>` (branch `worktree-<name>`, base per `worktree.baseRef`) and finds the transcript because the path matches again.
 - `~/.claude/sessions/<pid>.json` describes live claude processes (`{pid, sessionId, cwd, ...}`). Stale files survive crashes — always validate `/proc/<pid>/comm == "claude"` before trusting one.

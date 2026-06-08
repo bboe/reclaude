@@ -370,13 +370,13 @@ def live_sessions(
 
 
 def mung_path(path: str, /) -> str:
-    """Return the munged ~/.claude/projects dir name: '/' and '.' become '-'.
+    """Return the munged ~/.claude/projects dir name: '/', '.', '_' become '-'.
 
     Returns:
-        The munged directory name: '/' and '.' become '-'.
+        The munged directory name: '/', '.', and '_' become '-'.
 
     """
-    return path.replace("/", "-").replace(".", "-")
+    return path.replace("/", "-").replace(".", "-").replace("_", "-")
 
 
 def parse_history(lines: Iterable[str], /) -> list[Entry]:
