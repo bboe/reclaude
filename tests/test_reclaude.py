@@ -346,6 +346,11 @@ def test_mung_path() -> None:
         core.mung_path("/home/u/repo/.claude/worktrees/a1")
         == "-home-u-repo--claude-worktrees-a1"
     )
+    # Underscores mung to '-' too, so dirs like claude_throwaway_session resolve.
+    assert (
+        core.mung_path("/Users/b/claude_throwaway_session")
+        == "-Users-b-claude-throwaway-session"
+    )
 
 
 def test_parse_history_basic() -> None:
