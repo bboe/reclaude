@@ -31,6 +31,14 @@ if TYPE_CHECKING:
 
     from reclaude.core import DirRow, Group, SessionRow
 
+_BACKSPACE_KEYS = frozenset({8, 127, curses.KEY_BACKSPACE})
+_ENTER_KEYS = frozenset({10, 13, curses.KEY_ENTER})
+_EXPAND_KEYS = frozenset({ord("\t"), curses.KEY_RIGHT})
+_KEY_CTRL_T = 20
+_KEY_CTRL_W = 23
+_KEY_ESCAPE = 27
+_MIN_ROWS_WITH_FOOTER = 2
+_PRINTABLE_KEYS = range(32, 127)
 # AGE_WINDOWS is in Ctrl-T cycle order (coarsest to finest), not sorted.
 AGE_WINDOWS = [
     ("all", None),
@@ -48,14 +56,6 @@ HELP = (
     "^T age · type to filter · q quit"
 )
 HISTORY_PATH = Path("~/.claude/history.jsonl").expanduser()
-_BACKSPACE_KEYS = frozenset({8, 127, curses.KEY_BACKSPACE})
-_ENTER_KEYS = frozenset({10, 13, curses.KEY_ENTER})
-_EXPAND_KEYS = frozenset({ord("\t"), curses.KEY_RIGHT})
-_KEY_CTRL_T = 20
-_KEY_CTRL_W = 23
-_KEY_ESCAPE = 27
-_MIN_ROWS_WITH_FOOTER = 2
-_PRINTABLE_KEYS = range(32, 127)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
