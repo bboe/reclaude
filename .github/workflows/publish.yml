@@ -1,25 +1,16 @@
-jobs:
-  publish:
-    environment: pypi
-    permissions:
-      contents: read
-      id-token: write
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          persist-credentials: false
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          enable-cache: false
-      - run: uv build
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
-
 name: publish
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      id-token: write
+    uses: bboe/.github/.github/workflows/pypi-publish.yml@main
