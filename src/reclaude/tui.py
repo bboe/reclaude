@@ -49,8 +49,9 @@ AGE_WINDOWS = [
 ]
 # COLOR_KEYS must cover every key that core.row_spans emits.
 COLOR_KEYS = ("flash", "gone", "orphan", "path", "running", "text", "time")
-FLASH_BUSY = "that directory already has a claude session running"
+FLASH_CONFIRM = "this directory already has a running session — resume anyway? (y/n)"
 FLASH_GONE = "directory no longer exists"
+FLASH_RUNNING = "that session is already running"
 HELP = (
     "↑↓ move · ⏎ resume · →/⇥ expand · ← collapse · ^W missing · "
     "^T age · type to filter · q quit"
@@ -89,6 +90,7 @@ class _PickerState:
     expanded: set[str] = dataclasses.field(default_factory=set)
     filter_text: str = ""
     flash: str = ""
+    pending: Launch | None = None
     scroll_top: int = 0
     selection: int = 0
     show_missing: bool = True
@@ -136,7 +138,9 @@ def _build_frame(
         )
         for row in rows
     ]
-    if state.flash:
+    if state.pending is not None:
+        footer, footer_attr = FLASH_CONFIRM, context.attrs["flash"]
+    elif state.flash:
         footer, footer_attr = state.flash, context.attrs["flash"]
         state.flash = ""
     elif state.filter_text:
@@ -234,6 +238,23 @@ def _exec_claude(*, launch: Launch) -> NoReturn:
         _die(f"cannot exec claude: {error}")
 
 
+def _handle_confirm_key(key: int, /, *, state: _PickerState) -> Launch | None:
+    """Resolve the pending busy-dir confirmation against one keypress.
+
+    Clears state.pending unconditionally: 'y'/'Y' confirms the stashed launch,
+    any other key (including Esc, navigation, or a resize) cancels it.
+
+    Returns:
+        The confirmed Launch, or None when the prompt was cancelled.
+
+    """
+    pending = state.pending
+    state.pending = None
+    if key in {ord("Y"), ord("y")}:
+        return pending
+    return None
+
+
 def _handle_filter_key(key: int, /, *, state: _PickerState) -> bool:
     """Apply a filter/toggle key (Esc, backspace, ^W, ^T, printable) to state.
 
@@ -266,7 +287,12 @@ def _handle_filter_key(key: int, /, *, state: _PickerState) -> bool:
 
 
 def _handle_nav_key(
-    key: int, /, *, rows: list[DirRow | SessionRow], state: _PickerState
+    key: int,
+    /,
+    *,
+    rows: list[DirRow | SessionRow],
+    running_ids: set[str],
+    state: _PickerState,
 ) -> Launch | None:
     """Apply a navigation key (arrows, enter, tab) to state.
 
@@ -279,7 +305,7 @@ def _handle_nav_key(
     elif key == curses.KEY_DOWN and rows:
         state.selection = min(len(rows) - 1, state.selection + 1)
     elif key in _ENTER_KEYS and rows:
-        return _select_row(rows=rows, state=state)
+        return _select_row(rows=rows, running_ids=running_ids, state=state)
     elif key in _EXPAND_KEYS and rows:
         if rows[state.selection]["kind"] == "dir":
             state.expanded.add(rows[state.selection]["group"]["path"])
@@ -325,26 +351,39 @@ def _load_groups() -> list[Group]:
 
 
 def _select_row(
-    *, rows: list[DirRow | SessionRow], state: _PickerState
+    *, rows: list[DirRow | SessionRow], running_ids: set[str], state: _PickerState
 ) -> Launch | None:
     """Resolve enter on the selected row.
 
+    A dir row launches its newest visible session (display = action). Resuming
+    the session that is itself already running is refused outright (two
+    processes on one transcript would corrupt it); resuming a *different*
+    session in a busy dir arms a y/n confirmation (state.pending) instead of
+    launching — the shared working tree is the caller's risk to accept.
+
     Returns:
-        The Launch for the selected session (a dir row launches its newest
-        visible session — display = action), or None with a flash set when
-        the row is busy or gone.
+        The Launch when the row resumes immediately, or None when it is gone,
+        already running, or now awaiting confirmation.
 
     """
     row = rows[state.selection]
-    if row["busy"]:
-        state.flash = FLASH_BUSY
-    elif row["cls"].kind == "gone":
+    if row["cls"].kind == "gone":
         state.flash = FLASH_GONE
-    elif row["kind"] == "session":
-        return _launch(row=row, session_id=row["session"]["session_id"])
+        return None
+    if row["kind"] == "session":
+        session_id = row["session"]["session_id"]
+        running = row["running"]
     else:
-        return _launch(row=row, session_id=row["vis_sessions"][0]["session_id"])
-    return None
+        session_id = row["vis_sessions"][0]["session_id"]
+        running = session_id in running_ids
+    if running:
+        state.flash = FLASH_RUNNING
+        return None
+    launch = _launch(row=row, session_id=session_id)
+    if row["busy"]:
+        state.pending = launch
+        return None
+    return launch
 
 
 def _visible_rows(
@@ -453,7 +492,14 @@ def run_picker(
         frame = _build_frame(context=context, now_ms=now_ms, rows=rows, state=state)
         state.scroll_top = _draw(stdscr, attrs=context.attrs, frame=frame)
         key = stdscr.getch()
-        launch = _handle_nav_key(key, rows=rows, state=state)
+        if state.pending is not None:
+            launch = _handle_confirm_key(key, state=state)
+            if launch is not None:
+                return launch
+            continue
+        launch = _handle_nav_key(
+            key, rows=rows, running_ids=context.running_ids, state=state
+        )
         if launch is not None:
             return launch
         if _handle_filter_key(key, state=state):

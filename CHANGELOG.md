@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- A directory that already has a running `claude` is no longer hard-locked.
+  Resuming a *different* session there now asks for `y/n` confirmation before
+  launching, so you can deliberately run a second session in the same working
+  tree. Resuming the session that is *itself* already running is still refused
+  outright, since two processes sharing one transcript would corrupt it.
+
 ## [0.2.0] - 2026-06-08
 
 ### Added
@@ -34,5 +43,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On selection, `chdir`s into the chosen directory and execs
   `claude --resume <id>`.
 
+[Unreleased]: https://github.com/bboe/reclaude/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bboe/reclaude/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bboe/reclaude/releases/tag/v0.1.0
