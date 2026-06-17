@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `reclaude --version` prints the installed version (and `reclaude.__version__`
+  exposes it), sourced from the package metadata so there is a single source of
+  truth.
+
 ### Changed
 - A directory that already has a running `claude` is no longer hard-locked.
   Resuming a *different* session there now asks for `y/n` confirmation before
