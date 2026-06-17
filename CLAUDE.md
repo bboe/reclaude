@@ -18,7 +18,7 @@ reclaude                                                # run (needs a real TTY)
 reclaude --version                                      # print version (from package metadata), then exit
 ```
 
-No third-party runtime dependencies (Python 3.10+ stdlib; pytest for tests). `[tool.pytest.ini_options] pythonpath = ["src"]` in `pyproject.toml` lets `python3 -m pytest` import the package from the repo root without an install. Releases publish to PyPI via `.github/workflows/publish.yml` (trusted publishing) on a `v*` tag push.
+No third-party runtime dependencies (Python 3.10+ stdlib; pytest for tests). `[tool.pytest.ini_options] pythonpath = ["src"]` in `pyproject.toml` lets `python3 -m pytest` import the package from the repo root without an install. Releases publish to PyPI via `.github/workflows/pypi-publish.yml` (trusted publishing) on a `v*` tag push.
 
 ## Architecture
 
