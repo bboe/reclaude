@@ -13,6 +13,7 @@ import shutil
 # another process's identity and cwd on POSIX systems without /proc (macOS/BSD).
 import subprocess  # noqa: S404
 import sys
+from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
@@ -633,3 +634,17 @@ def truncate(text: str, /, *, width: int) -> str:
     if len(text) <= width:
         return text
     return text[: width - 1] + "…"
+
+
+def version() -> str:
+    """Return the installed reclaude version.
+
+    Returns:
+        The distribution version (sourced from pyproject.toml at build time),
+        or a sentinel when running from a source tree with no installed dist.
+
+    """
+    try:
+        return metadata.version("reclaude")
+    except metadata.PackageNotFoundError:
+        return "0+unknown"

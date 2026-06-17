@@ -3,6 +3,8 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from reclaude import core
 
 
@@ -538,3 +540,14 @@ def test_truncate() -> None:
     assert core.truncate("hello", width=10) == "hello"
     assert core.truncate("hello world", width=8) == "hello w…"
     assert not core.truncate("hi", width=0)
+
+
+def test_version(*, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(core.metadata, "version", lambda _name: "1.2.3")
+    assert core.version() == "1.2.3"
+
+    def _missing(_name: str) -> str:
+        raise core.metadata.PackageNotFoundError
+
+    monkeypatch.setattr(core.metadata, "version", _missing)
+    assert core.version() == "0+unknown"

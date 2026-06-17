@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import curses
 import dataclasses
@@ -24,6 +25,7 @@ from reclaude.core import (
     row_spans,
     transcript_exists,
     truncate,
+    version,
 )
 
 if TYPE_CHECKING:
@@ -350,6 +352,20 @@ def _load_groups() -> list[Group]:
     return groups
 
 
+def _parse_args() -> None:
+    """Handle --version/--help; the picker itself takes no other arguments.
+
+    argparse exits the process for --version, --help, or an unknown argument,
+    so a normal return means there is nothing to do and main() proceeds.
+    """
+    parser = argparse.ArgumentParser(
+        description="Curses picker for resuming Claude Code sessions.",
+        prog="reclaude",
+    )
+    parser.add_argument("--version", action="version", version=f"reclaude {version()}")
+    parser.parse_args()
+
+
 def _select_row(
     *, rows: list[DirRow | SessionRow], running_ids: set[str], state: _PickerState
 ) -> Launch | None:
@@ -445,6 +461,7 @@ def init_colors() -> dict[str, int]:
 
 def main() -> None:
     """Pick a recent Claude Code session and exec claude on it."""
+    _parse_args()
     groups = _load_groups()
     busy, running_ids = live_sessions()
     if not sys.stdout.isatty():
