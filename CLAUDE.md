@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`reclaude` is a stdlib-only Python curses picker for resuming Claude Code sessions. It reads `~/.claude/history.jsonl`, shows recent project directories as an expandable tree (sessions inline), locks directories that already have a running claude session, can resurrect sessions from deleted git worktrees, then chdirs and execs `claude`. Packaged for PyPI; installed with `uv tool install reclaude` (or `uv tool install --editable .` for hacking), which puts the `reclaude` console script on `PATH`.
+`reclaude` is a stdlib-only Python curses picker for resuming Claude Code sessions. It reads `~/.claude/history.jsonl`, shows recent project directories as an expandable tree (sessions inline), refuses to re-attach a session that is already running and asks for y/n confirmation before resuming a second session in a directory that already has one live, can resurrect sessions from deleted git worktrees, then chdirs and execs `claude`. Packaged for PyPI; installed with `uv tool install reclaude` (or `uv tool install --editable .` for hacking), which puts the `reclaude` console script on `PATH`.
 
 ## Commands
 
@@ -31,6 +31,7 @@ Data flow: `history.jsonl` → entries → groups (sessions attributed to their 
 ### Invariants worth protecting
 
 - **Display = action.** A dir row shows the time/prompt of `vis_sessions[0]` and Enter resumes exactly that session id. Never reintroduce `claude --continue` — it can disagree with what's displayed.
+- **Re-attaching a live session is refused; a second session in a busy dir is confirmed.** Resuming a session whose id is in `running_ids` is hard-blocked (two processes on one transcript corrupts it). Resuming a *different* session in a busy dir stashes the `Launch` in `_PickerState.pending` and arms a y/n footer prompt — only `y` proceeds, accepting the shared-working-tree risk. The confirm key is handled in `run_picker` *before* the filter, so y/n there never feed the incremental filter. A worktree can't isolate a resume: transcripts are bound to the cwd the session started in.
 - **Filters before the MAX_DIRS cap** in `flatten_rows`, so hiding noise surfaces older live dirs.
 - **Printable keys feed the incremental filter.** New shortcuts must be control keys (Ctrl-W=23 toggles missing dirs, Ctrl-T=20 cycles the age window); `q` quits only when the filter is empty.
 - `tui.COLOR_KEYS` must cover every key `core.row_spans` emits.
