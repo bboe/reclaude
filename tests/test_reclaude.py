@@ -405,6 +405,11 @@ def test_mung_path() -> None:
         core.mung_path("/Users/b/claude_throwaway_session")
         == "-Users-b-claude-throwaway-session"
     )
+    # Spaces mung to '-' too, so paths like ~/Library/Application Support resolve.
+    assert (
+        core.mung_path("/Users/b/Library/Application Support/x")
+        == "-Users-b-Library-Application-Support-x"
+    )
 
 
 def test_parse_history_basic() -> None:
