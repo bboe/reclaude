@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 MAX_DIRS = 30
 MS_PER_DAY = 86_400_000
 MS_PER_HOUR = 3_600_000
+# Path chars that collapse to '-' in a ~/.claude/projects dir name (see mung_path).
+MUNG_RE = re.compile(r"[/._ ]")
 # /proc is read directly on Linux; None routes liveness/cwd through ps + lsof
 # (macOS and other POSIX without /proc). Selected once, here, by platform.
 PROC_ROOT = "/proc" if sys.platform == "linux" else None
@@ -481,13 +483,13 @@ def live_sessions(
 
 
 def mung_path(path: str, /) -> str:
-    """Return the munged ~/.claude/projects dir name: '/', '.', '_' become '-'.
+    """Return the munged ~/.claude/projects dir name: '/', '.', '_', ' ' become '-'.
 
     Returns:
-        The munged directory name: '/', '.', and '_' become '-'.
+        The munged directory name: '/', '.', '_', and ' ' become '-'.
 
     """
-    return path.replace("/", "-").replace(".", "-").replace("_", "-")
+    return MUNG_RE.sub("-", path)
 
 
 def parse_history(lines: Iterable[str], /) -> list[Entry]:
