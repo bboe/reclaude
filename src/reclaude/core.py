@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING, TypedDict
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+# Transcript title records, in precedence order: a /rename (custom-title)
+# beats the auto-generated ai-title; within each kind the newest record wins.
+_TITLE_MARKERS = (
+    ("customTitle", b'{"type":"custom-title"'),
+    ("aiTitle", b'{"type":"ai-title"'),
+)
 MAX_DIRS = 30
 MS_PER_DAY = 86_400_000
 MS_PER_HOUR = 3_600_000
@@ -120,10 +126,11 @@ class RowFilter:
 
 
 class Session(TypedDict):
-    """One session's newest timestamp and prompt."""
+    """One session's newest timestamp, prompt, and title ("" when untitled)."""
 
     display: str
     session_id: str
+    title: str
     ts: float
 
 
@@ -132,6 +139,17 @@ class SessionRow(BaseRow):
 
     running: bool
     session: Session
+
+
+def _clean_text(text: str, /) -> str:
+    """Flatten whitespace and strip control characters from user-visible text.
+
+    Returns:
+        The text with whitespace runs collapsed to single spaces and the
+        remaining unprintable characters (e.g. escape sequences) removed.
+
+    """
+    return "".join(char for char in " ".join(text.split()) if char.isprintable())
 
 
 def _is_claude_pid(
@@ -153,6 +171,34 @@ def _is_claude_pid(
     with contextlib.suppress(OSError):
         comm = (Path(proc_root) / str(pid) / "comm").read_text(encoding="utf-8")
     return _looks_like_claude(comm)
+
+
+def _last_title(data: bytes, /, *, field: str, marker: bytes) -> str:
+    """Extract the newest valid title of one kind from raw transcript bytes.
+
+    Scans backwards for lines starting with marker (a line-start anchor, so a
+    title record merely *quoted* inside message content never matches — JSON
+    escaping mangles it mid-line anyway), parsing each candidate until one
+    yields a non-empty string in field.
+
+    Returns:
+        The flattened title text, or "" when no candidate line parses.
+
+    """
+    pos = len(data)
+    while (pos := data.rfind(marker, 0, pos)) != -1:
+        if pos > 0 and data[pos - 1 : pos] != b"\n":
+            continue
+        newline = data.find(b"\n", pos)
+        line = data[pos : newline if newline != -1 else len(data)]
+        record = None
+        with contextlib.suppress(ValueError):
+            record = json.loads(line)
+        if isinstance(record, dict):
+            title = record.get(field)
+            if isinstance(title, str) and (cleaned := _clean_text(title)):
+                return cleaned
+    return ""
 
 
 def _live_record(
@@ -366,7 +412,11 @@ def flatten_rows(
             session
             for session in group["sessions"]
             if (criteria.min_ts is None or session["ts"] >= criteria.min_ts)
-            and (path_match or filter_lower in session["display"].lower())
+            and (
+                path_match
+                or filter_lower in session["display"].lower()
+                or filter_lower in session["title"].lower()
+            )
         ]
         if not visible:
             continue
@@ -401,13 +451,17 @@ def flatten_rows(
 
 
 def group_by_home(
-    *, entries: list[Entry], transcript_exists: Callable[..., bool]
+    *,
+    entries: list[Entry],
+    session_title: Callable[..., str],
+    transcript_exists: Callable[..., bool],
 ) -> list[Group]:
     """Group sessions under their home dir (first project seen), newest first.
 
     A session's transcript lives where the session started, so that first
     directory is the only place `claude --resume` can find it. Sessions whose
-    transcript no longer exists are dropped.
+    transcript no longer exists are dropped; the rest are titled via
+    session_title ("" when untitled).
 
     Returns:
         Groups sorted newest-first, each with its sessions newest-first.
@@ -430,6 +484,7 @@ def group_by_home(
             Session(
                 display=session["display"],
                 session_id=session_id,
+                title=session_title(home_dir=session["home"], session_id=session_id),
                 ts=session["ts"],
             )
         )
@@ -519,14 +574,9 @@ def parse_history(lines: Iterable[str], /) -> list[Entry]:
             and not isinstance(timestamp, bool)
         ):
             continue
-        if isinstance(display, str):
-            # Flatten whitespace, then drop remaining control characters
-            # (e.g. \x1b) so prompts can't smuggle escape sequences.
-            display = "".join(
-                char for char in " ".join(display.split()) if char.isprintable()
-            )
-        else:
-            display = ""
+        # Flatten whitespace and drop control characters (e.g. \x1b) so
+        # prompts can't smuggle escape sequences.
+        display = _clean_text(display) if isinstance(display, str) else ""
         entries.append(
             Entry(
                 display=display,
@@ -582,7 +632,9 @@ def row_spans(
             spans.append((" [worktree gone]", "orphan"))
         elif row["cls"].kind == "gone":
             spans.append((" [gone]", "gone"))
-        last_display = visible[0]["display"] if visible else ""
+        # The session title (when the transcript has one) labels the row
+        # better than the last prompt; fall back to the prompt otherwise.
+        last_display = (visible[0]["title"] or visible[0]["display"]) if visible else ""
         if last_display:
             spans.append((f"  —  {last_display}", "text"))
         return spans
@@ -590,11 +642,40 @@ def row_spans(
     spans = [
         ("    ", "text"),
         (f"{relative_time(now_ms=now_ms, ts_ms=session['ts']):>4}  ", "time"),
-        (session["display"] or "(no prompt)", "text"),
+        (session["title"] or session["display"] or "(no prompt)", "text"),
     ]
     if row["running"]:
         spans.append((" [running]", "running"))
     return spans
+
+
+def session_title(
+    *, home_dir: str, projects_dir: str | None = None, session_id: str
+) -> str:
+    """Return the session's title from its transcript, or "" when untitled.
+
+    Claude Code appends {"type":"custom-title","customTitle":...} records
+    (/rename) and {"type":"ai-title","aiTitle":...} records (auto-generated)
+    to the transcript; the newest custom title wins over the newest AI title.
+    The scan is a raw byte search (no per-line JSON parsing), so multi-MB
+    transcripts stay cheap.
+
+    Returns:
+        The flattened title text, or "" when the transcript has none.
+
+    """
+    path = transcript_path(
+        home_dir=home_dir, projects_dir=projects_dir, session_id=session_id
+    )
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    for field, marker in _TITLE_MARKERS:
+        title = _last_title(data, field=field, marker=marker)
+        if title:
+            return title
+    return ""
 
 
 def transcript_exists(
