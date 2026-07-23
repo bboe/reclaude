@@ -57,8 +57,16 @@ def _group(*, path: str, sessions: list[core.Session]) -> core.Group:
     return core.Group(last_ts=sessions[0]["ts"], path=path, sessions=sessions)
 
 
-def _session(*, display: str = "", session_id: str, ts: float) -> core.Session:
-    return core.Session(display=display, session_id=session_id, ts=ts)
+def _session(
+    *, display: str = "", session_id: str, title: str = "", ts: float
+) -> core.Session:
+    return core.Session(display=display, session_id=session_id, title=title, ts=ts)
+
+
+def _transcript(*, lines: list[str], tmp_path: Path) -> None:
+    munged_dir = tmp_path / "-home-u-x"
+    munged_dir.mkdir(exist_ok=True)
+    (munged_dir / "s1.jsonl").write_text("\n".join(lines) + "\n")
 
 
 def test_abbreviate_path() -> None:
@@ -282,6 +290,28 @@ def test_flatten_rows_show_missing_and_min_ts() -> None:
     assert [row["group"] for row in rows] == [live, orphan]  # boundary ts kept
 
 
+def test_flatten_rows_title_text_match() -> None:
+    group = _group(
+        path="/p/a",
+        sessions=[
+            _session(
+                display="prompt", session_id="s1", title="Fix the parser", ts=2000
+            ),
+            _session(display="other", session_id="s2", ts=1000),
+        ],
+    )
+    rows = core.flatten_rows(
+        criteria=_criteria(
+            expanded={"/p/a"}, filter_text="PARSER", isdir=lambda _path: True
+        ),
+        groups=[group],
+    )
+    # the filter matches the session title even though the prompt doesn't
+    assert [
+        (row["kind"], row.get("session", {}).get("session_id")) for row in rows
+    ] == [("dir", None), ("session", "s1")]
+
+
 def test_group_by_home_attribution_and_order() -> None:
     entries = [
         _entry(display="first", project="/p/a", session_id="s1", ts=1000),
@@ -291,7 +321,9 @@ def test_group_by_home_attribution_and_order() -> None:
         _entry(display="newest", project="/p/c", session_id="s3", ts=9000),
     ]
     groups = core.group_by_home(
-        entries=entries, transcript_exists=lambda *_args, **_kwargs: True
+        entries=entries,
+        session_title=lambda **_kwargs: "",
+        transcript_exists=lambda *_args, **_kwargs: True,
     )
     assert [group["path"] for group in groups] == ["/p/c", "/p/a"]
     group_a = groups[1]
@@ -304,7 +336,9 @@ def test_group_by_home_drops_empty_groups() -> None:
     entries = [_entry(project="/p/a", session_id="s1", ts=1000)]
     assert (
         core.group_by_home(
-            entries=entries, transcript_exists=lambda *_args, **_kwargs: False
+            entries=entries,
+            session_title=lambda **_kwargs: "",
+            transcript_exists=lambda *_args, **_kwargs: False,
         )
         == []
     )
@@ -318,10 +352,24 @@ def test_group_by_home_drops_sessions_without_transcript() -> None:
     ]
     groups = core.group_by_home(
         entries=entries,
+        session_title=lambda **_kwargs: "",
         transcript_exists=lambda **kwargs: kwargs["session_id"] != "s2",
     )
     assert [group["path"] for group in groups] == ["/p/b", "/p/a"]
     assert [session["session_id"] for session in groups[1]["sessions"]] == ["s1"]
+
+
+def test_group_by_home_titles() -> None:
+    entries = [
+        _entry(project="/p/a", session_id="s1", ts=1000),
+        _entry(project="/p/a", session_id="s2", ts=2000),
+    ]
+    groups = core.group_by_home(
+        entries=entries,
+        session_title=lambda **kwargs: "named" if kwargs["session_id"] == "s2" else "",
+        transcript_exists=lambda *_args, **_kwargs: True,
+    )
+    assert [session["title"] for session in groups[0]["sessions"]] == ["named", ""]
 
 
 def test_launch_argv() -> None:
@@ -520,6 +568,78 @@ def test_row_spans_dir() -> None:
         (" [running]", "running"),
         ("  —  older", "text"),
     ]
+
+
+def test_row_spans_prefers_title() -> None:
+    group = _group(
+        path="/h/proj",
+        sessions=[_session(display="prompt", session_id="s1", title="Named", ts=0)],
+    )
+    row = core.DirRow(
+        busy=False,
+        cls=core.Classification(kind="live"),
+        group=group,
+        kind="dir",
+        vis_sessions=group["sessions"],
+    )
+    assert ("  —  Named", "text") in core.row_spans(row, home="/h", now_ms=0)
+    session_row = core.SessionRow(
+        busy=False,
+        cls=core.Classification(kind="live"),
+        group=group,
+        kind="session",
+        running=False,
+        session=group["sessions"][0],
+    )
+    assert ("Named", "text") in core.row_spans(session_row, home="/h", now_ms=0)
+
+
+def test_session_title(*, tmp_path: Path) -> None:
+    _transcript(
+        lines=[
+            '{"type":"ai-title","aiTitle":"First title","sessionId":"s1"}',
+            '{"type":"user","message":"mentions {\\"type\\":\\"ai-title\\" inline"}',
+            '{"type":"ai-title","aiTitle":"Second title","sessionId":"s1"}',
+        ],
+        tmp_path=tmp_path,
+    )
+    title = core.session_title(
+        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+    )
+    assert title == "Second title"  # newest ai-title wins; quoted mention ignored
+
+
+def test_session_title_custom_wins_and_sanitizes(*, tmp_path: Path) -> None:
+    _transcript(
+        lines=[
+            '{"type":"custom-title","customTitle":"my\\nrename\\u001b","sessionId":"s1"}',
+            '{"type":"ai-title","aiTitle":"Newer AI title","sessionId":"s1"}',
+        ],
+        tmp_path=tmp_path,
+    )
+    title = core.session_title(
+        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+    )
+    # a /rename beats a newer ai-title; whitespace/controls are flattened
+    assert title == "my rename"
+
+
+def test_session_title_missing_and_malformed(*, tmp_path: Path) -> None:
+    assert not core.session_title(
+        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+    )
+    _transcript(
+        lines=[
+            '{"type":"ai-title","aiTitle":"Good title","sessionId":"s1"}',
+            '{"type":"ai-title","aiTitle":123,"sessionId":"s1"}',  # non-string
+            '{"type":"ai-title","aiTitle":"truncated',  # invalid json
+        ],
+        tmp_path=tmp_path,
+    )
+    title = core.session_title(
+        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+    )
+    assert title == "Good title"  # malformed newer records fall through
 
 
 def test_transcript_exists(*, tmp_path: Path) -> None:

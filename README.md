@@ -6,7 +6,8 @@ expandable tree with sessions inline, so you can jump back into a conversation w
 remembering its session id.
 
 - **Tree view** of recent directories; expand one to see its individual sessions, each shown
-  with its time and opening prompt.
+  with its time and session name (the `/rename` or auto-generated title, falling back to the
+  latest prompt when a session has neither).
 - **Live-session locks** — directories with a running `claude` process are marked so you don't
   collide with an active session.
 - **Worktree resurrection** — sessions from deleted git worktrees can be brought back; reclaude
@@ -32,7 +33,7 @@ reclaude          # or: python -m reclaude
 | -------------- | ------------------------------------------------- |
 | `↑` / `↓`      | Move selection                                    |
 | `Enter`        | Expand a directory, or resume the selected session |
-| *type*         | Incrementally filter by directory / prompt text   |
+| *type*         | Incrementally filter by directory / name / prompt |
 | `Ctrl-W`       | Toggle showing directories whose path is gone     |
 | `Ctrl-T`       | Cycle the age window (how far back to look)        |
 | `Backspace`    | Delete a filter character                         |

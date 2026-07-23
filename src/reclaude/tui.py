@@ -23,6 +23,7 @@ from reclaude.core import (
     live_sessions,
     parse_history,
     row_spans,
+    session_title,
     transcript_exists,
     truncate,
     version,
@@ -346,7 +347,11 @@ def _load_groups() -> list[Group]:
             entries = parse_history(file)
     except OSError as error:
         _die(f"cannot read {HISTORY_PATH}: {error}")
-    groups = group_by_home(entries=entries, transcript_exists=transcript_exists)
+    groups = group_by_home(
+        entries=entries,
+        session_title=session_title,
+        transcript_exists=transcript_exists,
+    )
     if not groups:
         _die("no resumable sessions found in history")
     return groups
