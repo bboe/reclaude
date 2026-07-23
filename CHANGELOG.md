@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-22
+
+### Added
+- Session rows (and each directory's summary row) now show the session's name —
+  the `/rename` custom title or Claude Code's auto-generated title, read from
+  the transcript's `custom-title`/`ai-title` records — falling back to the
+  latest prompt when a session has neither. The incremental filter matches
+  names too.
+
 ## [0.3.1] - 2026-07-07
 
 ### Fixed
