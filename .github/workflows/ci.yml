@@ -12,8 +12,8 @@ jobs:
   ci:
     uses: bboe/.github/.github/workflows/python-ci.yml@main
     with:
-      lint: false
-      test-group: dev
+      lint: true
       locked: true
       os: '["ubuntu-latest", "macos-latest"]'
       pytest-args: "-q"
+      test-group: dev
