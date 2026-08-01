@@ -7,6 +7,11 @@ import contextlib
 import curses
 import dataclasses
 import os
+import shutil
+
+# subprocess only ever runs a Launch's setup argv — a fixed `git worktree add`
+# list built by core.plan_launch, never a shell string.
+import subprocess  # noqa: S404
 import sys
 import time
 from pathlib import Path
@@ -15,16 +20,16 @@ from typing import TYPE_CHECKING
 from reclaude.core import (
     MS_PER_DAY,
     MS_PER_HOUR,
-    Launch,
     RowFilter,
     clamp_scroll,
     flatten_rows,
     group_by_home,
     live_sessions,
     parse_history,
+    plan_launch,
     row_spans,
     session_title,
-    transcript_exists,
+    transcript_home,
     truncate,
     version,
 )
@@ -32,7 +37,7 @@ from reclaude.core import (
 if TYPE_CHECKING:
     from typing import NoReturn
 
-    from reclaude.core import DirRow, Group, SessionRow
+    from reclaude.core import DirRow, Group, Launch, SessionRow
 
 _BACKSPACE_KEYS = frozenset({8, 127, curses.KEY_BACKSPACE})
 _ENTER_KEYS = frozenset({10, 13, curses.KEY_ENTER})
@@ -142,7 +147,14 @@ def _build_frame(
         for row in rows
     ]
     if state.pending is not None:
-        footer, footer_attr = FLASH_CONFIRM, context.attrs["flash"]
+        # A Launch that changes the repo carries its own warning; otherwise
+        # the prompt is the busy-dir one.
+        footer = (
+            FLASH_CONFIRM
+            if state.pending.confirm is None
+            else f"{state.pending.confirm} — proceed? (y/n)"
+        )
+        footer_attr = context.attrs["flash"]
     elif state.flash:
         footer, footer_attr = state.flash, context.attrs["flash"]
         state.flash = ""
@@ -224,12 +236,14 @@ def _draw(stdscr: curses.window, /, *, attrs: dict[str, int], frame: _Frame) -> 
 
 
 def _exec_claude(*, launch: Launch) -> NoReturn:
-    """Chdir to the picked directory and exec claude on the picked session."""
-    for value in (launch.session_id, launch.worktree_name):
+    """Run any setup command, chdir to the picked directory, and exec claude."""
+    for value in (launch.session_id, launch.worktree_name, *(launch.setup or ())):
         # Option values come from history.jsonl; never let one be parsed as
         # an option.
         if value is not None and value.startswith("-"):
             _die(f"refusing option-like argument {value!r}")
+    if launch.setup is not None:
+        _run_setup(launch.setup)
     try:
         os.chdir(launch.path)
     except OSError as error:
@@ -317,24 +331,6 @@ def _handle_nav_key(
     return None
 
 
-def _launch(*, row: DirRow | SessionRow, session_id: str) -> Launch:
-    """Build the Launch for a row's session.
-
-    Returns:
-        A worktree-resurrecting Launch for orphaned worktrees, else a plain
-        resume in the row's directory.
-
-    """
-    classification = row["cls"]
-    if classification.kind == "orphan-worktree":
-        return Launch(
-            path=classification.repo,
-            session_id=session_id,
-            worktree_name=classification.name,
-        )
-    return Launch(path=row["group"]["path"], session_id=session_id)
-
-
 def _load_groups() -> list[Group]:
     """Read history.jsonl and group resumable sessions by home directory.
 
@@ -350,7 +346,7 @@ def _load_groups() -> list[Group]:
     groups = group_by_home(
         entries=entries,
         session_title=session_title,
-        transcript_exists=transcript_exists,
+        transcript_home=transcript_home,
     )
     if not groups:
         _die("no resumable sessions found in history")
@@ -369,6 +365,26 @@ def _parse_args() -> None:
     )
     parser.add_argument("--version", action="version", version=f"reclaude {version()}")
     parser.parse_args()
+
+
+def _run_setup(command: tuple[str, ...], /) -> None:
+    """Run a Launch's setup command, exiting with its stderr on failure.
+
+    This is the one place reclaude modifies a repo: restoring a deleted
+    worktree from its surviving branch, so the work returns with the session.
+    """
+    executable = shutil.which(command[0])
+    if executable is None:
+        _die(f"cannot run {command[0]}: not on PATH")
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [executable, *command[1:]], capture_output=True, check=False, text=True
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        _die(f"cannot run {' '.join(command)}: {error}")
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit {completed.returncode}"
+        _die(f"{' '.join(command)}: {detail}")
 
 
 def _select_row(
@@ -392,16 +408,17 @@ def _select_row(
         state.flash = FLASH_GONE
         return None
     if row["kind"] == "session":
-        session_id = row["session"]["session_id"]
         running = row["running"]
+        session = row["session"]
     else:
-        session_id = row["vis_sessions"][0]["session_id"]
-        running = session_id in running_ids
+        session = row["vis_sessions"][0]
+        running = session["session_id"] in running_ids
     if running:
         state.flash = FLASH_RUNNING
         return None
-    launch = _launch(row=row, session_id=session_id)
-    if row["busy"]:
+    launch = plan_launch(home=row["group"]["path"], session=session)
+    # A busy dir and a repo-changing launch both arm the same y/n prompt.
+    if row["busy"] or launch.confirm is not None:
         state.pending = launch
         return None
     return launch
