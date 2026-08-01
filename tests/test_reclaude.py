@@ -58,9 +58,11 @@ def _group(*, path: str, sessions: list[core.Session]) -> core.Group:
 
 
 def _session(
-    *, display: str = "", session_id: str, title: str = "", ts: float
+    *, display: str = "", session_id: str, store: str = "", title: str = "", ts: float
 ) -> core.Session:
-    return core.Session(display=display, session_id=session_id, title=title, ts=ts)
+    return core.Session(
+        display=display, session_id=session_id, store=store, title=title, ts=ts
+    )
 
 
 def _transcript(*, lines: list[str], tmp_path: Path) -> None:
@@ -323,7 +325,7 @@ def test_group_by_home_attribution_and_order() -> None:
     groups = core.group_by_home(
         entries=entries,
         session_title=lambda **_kwargs: "",
-        transcript_exists=lambda *_args, **_kwargs: True,
+        transcript_home=lambda **kwargs: kwargs["home_dir"],
     )
     assert [group["path"] for group in groups] == ["/p/c", "/p/a"]
     group_a = groups[1]
@@ -338,7 +340,7 @@ def test_group_by_home_drops_empty_groups() -> None:
         core.group_by_home(
             entries=entries,
             session_title=lambda **_kwargs: "",
-            transcript_exists=lambda *_args, **_kwargs: False,
+            transcript_home=lambda *_args, **_kwargs: None,
         )
         == []
     )
@@ -353,10 +355,30 @@ def test_group_by_home_drops_sessions_without_transcript() -> None:
     groups = core.group_by_home(
         entries=entries,
         session_title=lambda **_kwargs: "",
-        transcript_exists=lambda **kwargs: kwargs["session_id"] != "s2",
+        transcript_home=lambda **kwargs: (
+            None if kwargs["session_id"] == "s2" else kwargs["home_dir"]
+        ),
     )
     assert [group["path"] for group in groups] == ["/p/b", "/p/a"]
     assert [session["session_id"] for session in groups[1]["sessions"]] == ["s1"]
+
+
+def test_group_by_home_keeps_resolved_store() -> None:
+    # A worktree session whose transcript actually lives under the repo: the
+    # home stays the worktree (that is what history recorded) but store points
+    # at the repo, which is where `claude --resume` can find it. The title has
+    # to be read from the store too, not from the home.
+    worktree = "/r/.claude/worktrees/w1"
+    entries = [_entry(project=worktree, session_id="s1", ts=1000)]
+    titled_from = []
+    groups = core.group_by_home(
+        entries=entries,
+        session_title=lambda **kwargs: titled_from.append(kwargs["home_dir"]) or "",
+        transcript_home=lambda **_kwargs: "/r",
+    )
+    assert groups[0]["path"] == worktree
+    assert groups[0]["sessions"][0]["store"] == "/r"
+    assert titled_from == ["/r"]
 
 
 def test_group_by_home_titles() -> None:
@@ -367,7 +389,7 @@ def test_group_by_home_titles() -> None:
     groups = core.group_by_home(
         entries=entries,
         session_title=lambda **kwargs: "named" if kwargs["session_id"] == "s2" else "",
-        transcript_exists=lambda *_args, **_kwargs: True,
+        transcript_home=lambda **kwargs: kwargs["home_dir"],
     )
     assert [session["title"] for session in groups[0]["sessions"]] == ["named", ""]
 
@@ -503,6 +525,83 @@ def test_parse_history_skips_garbage() -> None:
     assert entries == [
         {"display": "", "project": "/p/c", "session_id": "s3", "ts": 3000}
     ]
+
+
+def test_plan_launch_non_worktree() -> None:
+    session = _session(session_id="s1", store="/p/a", ts=0)
+    assert core.plan_launch(
+        home="/p/a", isdir=lambda _path: True, session=session
+    ) == core.Launch(path="/p/a", session_id="s1")
+
+
+def test_plan_launch_worktree_gone_branch_gone() -> None:
+    # Nothing left to restore: claude recreates the worktree empty at the base
+    # ref, so the user has to accept losing the work first.
+    worktree = "/r/.claude/worktrees/w1"
+    launch = core.plan_launch(
+        branch_exists=lambda **_kwargs: False,
+        home=worktree,
+        isdir=lambda _path: False,
+        session=_session(session_id="s1", store=worktree, ts=0),
+    )
+    assert launch.path == "/r"
+    assert launch.setup is None
+    assert launch.worktree_name == "w1"
+    assert launch.confirm is not None
+    assert "EMPTY" in launch.confirm
+
+
+def test_plan_launch_worktree_gone_branch_survives() -> None:
+    # The branch still holds the work, so restore the worktree from it rather
+    # than letting `--worktree` reset the branch to the base ref.
+    worktree = "/r/.claude/worktrees/w1"
+    launch = core.plan_launch(
+        branch_exists=lambda **_kwargs: True,
+        home=worktree,
+        isdir=lambda _path: False,
+        session=_session(session_id="s1", store=worktree, ts=0),
+    )
+    assert launch.path == worktree
+    assert launch.worktree_name is None  # never let claude create it
+    assert launch.setup == (
+        "git",
+        "-C",
+        "/r",
+        "worktree",
+        "add",
+        worktree,
+        "worktree-w1",
+    )
+    assert launch.confirm is not None
+
+
+def test_plan_launch_worktree_gone_stored_in_repo() -> None:
+    # The transcript is under the repo, so resume there; recreating the
+    # worktree would be pointless and destructive.
+    launch = core.plan_launch(
+        branch_exists=lambda **_kwargs: True,
+        home="/r/.claude/worktrees/w1",
+        isdir=lambda _path: False,
+        session=_session(session_id="s1", store="/r", ts=0),
+    )
+    assert launch == core.Launch(path="/r", session_id="s1")
+
+
+def test_plan_launch_worktree_live() -> None:
+    worktree = "/r/.claude/worktrees/w1"
+    # Transcript under the worktree: cd in and resume, no --worktree needed.
+    assert core.plan_launch(
+        home=worktree,
+        isdir=lambda _path: True,
+        session=_session(session_id="s1", store=worktree, ts=0),
+    ) == core.Launch(path=worktree, session_id="s1")
+    # Transcript under the repo: launch from the repo with --worktree, which
+    # is safe precisely because claude will not have to create the worktree.
+    assert core.plan_launch(
+        home=worktree,
+        isdir=lambda _path: True,
+        session=_session(session_id="s2", store="/r", ts=0),
+    ) == core.Launch(path="/r", session_id="s2", worktree_name="w1")
 
 
 def test_relative_time() -> None:
@@ -642,15 +741,52 @@ def test_session_title_missing_and_malformed(*, tmp_path: Path) -> None:
     assert title == "Good title"  # malformed newer records fall through
 
 
-def test_transcript_exists(*, tmp_path: Path) -> None:
+def test_transcript_home(*, tmp_path: Path) -> None:
     munged_dir = tmp_path / "-home-u-x"
     munged_dir.mkdir()
     (munged_dir / "s1.jsonl").write_text("{}")
-    assert core.transcript_exists(
-        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+    assert (
+        core.transcript_home(
+            home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s1"
+        )
+        == "/home/u/x"
     )
-    assert not core.transcript_exists(
-        home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s2"
+    assert (
+        core.transcript_home(
+            home_dir="/home/u/x", projects_dir=str(tmp_path), session_id="s2"
+        )
+        is None
+    )
+
+
+def test_transcript_home_falls_back_to_repo(*, tmp_path: Path) -> None:
+    # A worktree session launched from the repo stores its transcript under
+    # the repo, even though history records the worktree as the project.
+    repo_dir = tmp_path / "-home-u-r"
+    repo_dir.mkdir()
+    (repo_dir / "s1.jsonl").write_text("{}")
+    worktree = "/home/u/r/.claude/worktrees/w1"
+    assert (
+        core.transcript_home(
+            home_dir=worktree, projects_dir=str(tmp_path), session_id="s1"
+        )
+        == "/home/u/r"
+    )
+
+
+def test_transcript_home_prefers_the_worktree(*, tmp_path: Path) -> None:
+    # When both locations hold a transcript, the worktree wins: that is where
+    # claude was launched from, so that is where --resume looks first.
+    worktree = "/home/u/r/.claude/worktrees/w1"
+    for name in ("-home-u-r", "-home-u-r--claude-worktrees-w1"):
+        munged_dir = tmp_path / name
+        munged_dir.mkdir()
+        (munged_dir / "s1.jsonl").write_text("{}")
+    assert (
+        core.transcript_home(
+            home_dir=worktree, projects_dir=str(tmp_path), session_id="s1"
+        )
+        == worktree
     )
 
 

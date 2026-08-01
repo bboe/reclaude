@@ -39,6 +39,7 @@ SECONDS_PER_DAY = MS_PER_DAY // 1000
 SECONDS_PER_HOUR = MS_PER_HOUR // 1000
 SECONDS_PER_MINUTE = 60
 SESSIONS_DIR = Path("~/.claude/sessions").expanduser()
+WORKTREE_BRANCH_PREFIX = "worktree-"
 WORKTREE_RE = re.compile(r"^(?P<repo>.+)/\.claude/worktrees/(?P<name>[^/]+)$")
 
 
@@ -87,8 +88,10 @@ class Group(TypedDict):
 class Launch:
     """A picked session: where to chdir and what to exec."""
 
+    confirm: str | None = None  # prompt to accept before launching, when set
     path: str
     session_id: str
+    setup: tuple[str, ...] | None = None  # run before chdir, when set
     worktree_name: str | None = None
 
     @property
@@ -96,8 +99,8 @@ class Launch:
         """Build the claude argv that resumes this session.
 
         Returns:
-            `claude --resume <id>`, preceded by `--worktree <name>` when the
-            session's deleted worktree must be resurrected first.
+            `claude --resume <id>`, preceded by `--worktree <name>` when
+            claude itself must create the worktree first.
 
         """
         if self.worktree_name is None:
@@ -130,6 +133,7 @@ class Session(TypedDict):
 
     display: str
     session_id: str
+    store: str  # dir whose munged projects dir actually holds the transcript
     title: str
     ts: float
 
@@ -139,6 +143,22 @@ class SessionRow(BaseRow):
 
     running: bool
     session: Session
+
+
+def _branch_exists(
+    *, branch: str, repo: str, run: Callable[[list[str]], str] | None = None
+) -> bool:
+    """Check whether repo has a local branch named branch.
+
+    run defaults to _run_command, which is defined further down the module.
+
+    Returns:
+        Whether `git -C <repo>` resolves refs/heads/<branch>.
+
+    """
+    runner = _run_command if run is None else run
+    command = ["git", "-C", repo, "rev-parse", "--verify", "--quiet"]
+    return bool(runner([*command, f"refs/heads/{branch}"]).strip())
 
 
 def _clean_text(text: str, /) -> str:
@@ -454,14 +474,17 @@ def group_by_home(
     *,
     entries: list[Entry],
     session_title: Callable[..., str],
-    transcript_exists: Callable[..., bool],
+    transcript_home: Callable[..., str | None],
 ) -> list[Group]:
     """Group sessions under their home dir (first project seen), newest first.
 
-    A session's transcript lives where the session started, so that first
-    directory is the only place `claude --resume` can find it. Sessions whose
-    transcript no longer exists are dropped; the rest are titled via
-    session_title ("" when untitled).
+    history.jsonl records the cwd a prompt was typed in, which for a worktree
+    session is the worktree — but the transcript lives under the dir claude
+    was *launched* from, which may instead be the owning repo. transcript_home
+    resolves which of the two actually holds it, and that dir is kept on the
+    session as "store" because both the resume command and session_title
+    depend on it. Sessions with no transcript in either location are dropped;
+    the rest are titled via session_title ("" when untitled).
 
     Returns:
         Groups sorted newest-first, each with its sessions newest-first.
@@ -478,13 +501,17 @@ def group_by_home(
             session["ts"] = entry["ts"]
     dirs = {}
     for session_id, session in sessions.items():
-        if not transcript_exists(home_dir=session["home"], session_id=session_id):
+        store = transcript_home(home_dir=session["home"], session_id=session_id)
+        if store is None:
             continue
         dirs.setdefault(session["home"], []).append(
             Session(
                 display=session["display"],
                 session_id=session_id,
-                title=session_title(home_dir=session["home"], session_id=session_id),
+                store=store,
+                # Titled from store, not home: the transcript is the only
+                # place a title lives, and store is where it actually is.
+                title=session_title(home_dir=store, session_id=session_id),
                 ts=session["ts"],
             )
         )
@@ -588,6 +615,58 @@ def parse_history(lines: Iterable[str], /) -> list[Entry]:
     return entries
 
 
+def plan_launch(
+    *,
+    branch_exists: Callable[..., bool] = _branch_exists,
+    home: str,
+    isdir: Callable[[str], bool] = os.path.isdir,
+    session: Session,
+) -> Launch:
+    """Decide how to resume a session homed in home.
+
+    `--worktree <name>` is only ever passed when claude will not have to
+    *create* the worktree, because creating one resets branch
+    `worktree-<name>` to the base ref and orphans any commits on it. When the
+    worktree is gone but its branch survives, the worktree is instead restored
+    with `git worktree add` (Launch.setup) so the work comes back with the
+    conversation. Only a missing branch forces the lossy path, which
+    Launch.confirm makes the user accept.
+
+    Returns:
+        The Launch resuming session, with setup/confirm set as needed.
+
+    """
+    match = WORKTREE_RE.match(home)
+    session_id = session["session_id"]
+    if match is None:
+        return Launch(path=home, session_id=session_id)
+    name = match.group("name")
+    repo = match.group("repo")
+    stored_in_repo = session["store"] != home
+    if isdir(home):
+        if stored_in_repo:
+            return Launch(path=repo, session_id=session_id, worktree_name=name)
+        return Launch(path=home, session_id=session_id)
+    if stored_in_repo:
+        # The transcript is under the repo, so resuming there needs no
+        # worktree at all — never recreate one just to satisfy the row.
+        return Launch(path=repo, session_id=session_id)
+    branch = f"{WORKTREE_BRANCH_PREFIX}{name}"
+    if branch_exists(branch=branch, repo=repo):
+        return Launch(
+            confirm=f"restore worktree {name} from branch {branch}",
+            path=home,
+            session_id=session_id,
+            setup=("git", "-C", repo, "worktree", "add", home, branch),
+        )
+    return Launch(
+        confirm=f"branch {branch} is gone; {name} comes back EMPTY, work is lost",
+        path=repo,
+        session_id=session_id,
+        worktree_name=name,
+    )
+
+
 def relative_time(*, now_ms: float, ts_ms: float) -> str:
     """Return a compact age like '5s', '3m', '7h', '2d'.
 
@@ -678,18 +757,32 @@ def session_title(
     return ""
 
 
-def transcript_exists(
+def transcript_home(
     *, home_dir: str, projects_dir: str | None = None, session_id: str
-) -> bool:
-    """Return whether the session's transcript exists under its munged dir.
+) -> str | None:
+    """Find which dir's munged projects dir holds the session's transcript.
+
+    A worktree session's transcript sits under mung(worktree) when claude was
+    launched from inside the worktree, and under mung(repo) when it was
+    launched from the repo with `--worktree` (or entered one mid-session), so
+    both are tried.
 
     Returns:
-        Whether the transcript file exists.
+        home_dir or its owning repo — whichever holds the transcript — or
+        None when neither does.
 
     """
-    return transcript_path(
-        home_dir=home_dir, projects_dir=projects_dir, session_id=session_id
-    ).is_file()
+    candidates = [home_dir]
+    match = WORKTREE_RE.match(home_dir)
+    if match:
+        candidates.append(match.group("repo"))
+    for candidate in candidates:
+        path = transcript_path(
+            home_dir=candidate, projects_dir=projects_dir, session_id=session_id
+        )
+        if path.is_file():
+            return candidate
+    return None
 
 
 def transcript_path(
