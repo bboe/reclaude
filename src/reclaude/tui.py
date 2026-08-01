@@ -56,7 +56,16 @@ AGE_WINDOWS = [
     ("1h", MS_PER_HOUR),
 ]
 # COLOR_KEYS must cover every key that core.row_spans emits.
-COLOR_KEYS = ("flash", "gone", "orphan", "path", "running", "text", "time")
+COLOR_KEYS = (
+    "flash",
+    "gone",
+    "orphan",
+    "path",
+    "running",
+    "text",
+    "time",
+    "worktree",
+)
 FLASH_CONFIRM = "this directory already has a running session — resume anyway? (y/n)"
 FLASH_GONE = "directory no longer exists"
 FLASH_RUNNING = "that session is already running"
@@ -416,7 +425,7 @@ def _select_row(
     if running:
         state.flash = FLASH_RUNNING
         return None
-    launch = plan_launch(home=row["group"]["path"], session=session)
+    launch = plan_launch(home=session["home"], session=session)
     # A busy dir and a repo-changing launch both arm the same y/n prompt.
     if row["busy"] or launch.confirm is not None:
         state.pending = launch
@@ -471,6 +480,7 @@ def init_colors() -> dict[str, int]:
                 ("orphan", curses.COLOR_MAGENTA),
                 ("running", curses.COLOR_YELLOW),
                 ("time", curses.COLOR_CYAN),
+                ("worktree", curses.COLOR_BLUE),
             ],
             start=1,
         ):

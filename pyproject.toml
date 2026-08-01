@@ -59,6 +59,7 @@ select = ["ALL"]
 "tests/*" = [
     "D1",      # tests are named, not documented
     "INP001",  # tests/ is intentionally not a package
+    "PLR0913", # fixture builders mirror a TypedDict's fields, one arg each
     "PLR2004", # literal timestamps/pids/indexes are the fixtures
     "S101",    # assert is pytest's assertion mechanism
 ]

@@ -54,14 +54,30 @@ def _fake_session_file(*, cwd: Path, dirpath: Path, pid: int, session_id: str) -
 
 
 def _group(*, path: str, sessions: list[core.Session]) -> core.Group:
+    # Sessions default to living in the group's own dir; a worktree session
+    # passes an explicit home, which is what nests it under its repo.
+    for session in sessions:
+        if not session["home"]:
+            session["home"] = path
     return core.Group(last_ts=sessions[0]["ts"], path=path, sessions=sessions)
 
 
 def _session(
-    *, display: str = "", session_id: str, store: str = "", title: str = "", ts: float
+    *,
+    display: str = "",
+    home: str = "",
+    session_id: str,
+    store: str = "",
+    title: str = "",
+    ts: float,
 ) -> core.Session:
     return core.Session(
-        display=display, session_id=session_id, store=store, title=title, ts=ts
+        display=display,
+        home=home,
+        session_id=session_id,
+        store=store,
+        title=title,
+        ts=ts,
     )
 
 
@@ -182,6 +198,58 @@ def test_flatten_rows_busy_and_classification() -> None:
     assert rows[1]["busy"] is True
 
 
+def test_flatten_rows_busy_and_classification_are_per_session() -> None:
+    # One repo row holding a repo session and two worktree sessions: busy and
+    # classification must follow each session's own home, not the group path.
+    live_wt = "/r/.claude/worktrees/keepopen"
+    dead_wt = "/r/.claude/worktrees/close"
+    group = _group(
+        path="/r",
+        sessions=[
+            _session(home=live_wt, session_id="s1", store=live_wt, ts=3000),
+            _session(home=dead_wt, session_id="s2", store="/r", ts=2000),
+            _session(home="/r", session_id="s3", ts=1000),
+        ],
+    )
+    rows = core.flatten_rows(
+        criteria=_criteria(
+            busy={live_wt},
+            expanded={"/r"},
+            isdir=lambda path: path != dead_wt,
+        ),
+        groups=[group],
+    )
+    # The dir row takes both from vis_sessions[0] — the session Enter resumes.
+    assert rows[0]["busy"] is True
+    assert rows[0]["cls"].kind == "live"
+    assert rows[0]["busy_any"] is True
+    assert [row["busy"] for row in rows[1:]] == [True, False, False]
+    assert [row["cls"].kind for row in rows[1:]] == [
+        "live",
+        "orphan-worktree",
+        "live",
+    ]
+
+
+def test_flatten_rows_dir_reports_busy_anywhere_beneath_it() -> None:
+    # A claude running in the repo must still show [running] on the row even
+    # when the newest session — the one Enter resumes — is in a quiet worktree.
+    worktree = "/r/.claude/worktrees/w1"
+    group = _group(
+        path="/r",
+        sessions=[
+            _session(home=worktree, session_id="s1", ts=2000),
+            _session(home="/r", session_id="s2", ts=1000),
+        ],
+    )
+    rows = core.flatten_rows(
+        criteria=_criteria(busy={"/r"}, isdir=lambda _path: True), groups=[group]
+    )
+    assert rows[0]["busy"] is False  # the launch target is not busy: no gate
+    assert rows[0]["busy_any"] is True  # but the row still reports the claude
+    assert (" [running]", "running") in core.row_spans(rows[0], home="/h", now_ms=2000)
+
+
 def test_flatten_rows_dir_top_reflects_filter() -> None:
     group = _group(
         path="/p/a",
@@ -243,6 +311,45 @@ def test_flatten_rows_filters_apply_before_cap() -> None:
     )
     assert len(rows) == 1
     assert rows[0]["group"] is live_old
+
+
+def test_flatten_rows_filters_by_worktree_name() -> None:
+    worktree = "/r/.claude/worktrees/keepopen"
+    group = _group(
+        path="/r",
+        sessions=[
+            _session(display="a", home=worktree, session_id="s1", ts=2000),
+            _session(display="b", home="/r", session_id="s2", ts=1000),
+        ],
+    )
+    rows = core.flatten_rows(
+        criteria=_criteria(
+            expanded={"/r"}, filter_text="keepopen", isdir=lambda _path: True
+        ),
+        groups=[group],
+    )
+    # Typing the worktree name keeps only the session living in it.
+    assert [row["session"]["session_id"] for row in rows[1:]] == ["s1"]
+
+
+def test_flatten_rows_hides_missing_worktree_session_only() -> None:
+    dead_wt = "/r/.claude/worktrees/close"
+    group = _group(
+        path="/r",
+        sessions=[
+            _session(home=dead_wt, session_id="s1", ts=2000),
+            _session(home="/r", session_id="s2", ts=1000),
+        ],
+    )
+    rows = core.flatten_rows(
+        criteria=_criteria(
+            expanded={"/r"}, isdir=lambda path: path != dead_wt, show_missing=False
+        ),
+        groups=[group],
+    )
+    # ^W hides the gone worktree's session without hiding the live repo row.
+    assert [row["kind"] for row in rows] == ["dir", "session"]
+    assert rows[1]["session"]["session_id"] == "s2"
 
 
 def test_flatten_rows_prompt_text_match() -> None:
@@ -376,7 +483,10 @@ def test_group_by_home_keeps_resolved_store() -> None:
         session_title=lambda **kwargs: titled_from.append(kwargs["home_dir"]) or "",
         transcript_home=lambda **_kwargs: "/r",
     )
-    assert groups[0]["path"] == worktree
+    # The group is the repo — worktree sessions nest under it — while the
+    # session keeps the worktree as its own home.
+    assert groups[0]["path"] == "/r"
+    assert groups[0]["sessions"][0]["home"] == worktree
     assert groups[0]["sessions"][0]["store"] == "/r"
     assert titled_from == ["/r"]
 
@@ -613,18 +723,43 @@ def test_relative_time() -> None:
     assert core.relative_time(now_ms=now, ts_ms=now + 5_000) == "0s"  # clock skew
 
 
-def test_row_spans_badges_and_session() -> None:
+def test_row_spans_badge_skipped_when_transcript_is_in_the_repo() -> None:
+    # An auto-reaped worktree whose transcript lives in the repo resumes with
+    # a plain --resume, so it must not be flagged as a problem.
+    worktree = "/r/.claude/worktrees/close"
     group = _group(
-        path="/r/.claude/worktrees/a1", sessions=[_session(session_id="s1", ts=0)]
+        path="/r",
+        sessions=[_session(home=worktree, session_id="s1", store="/r", ts=0)],
     )
     row = core.DirRow(
         busy=False,
+        busy_any=False,
+        cls=core.Classification(kind="orphan-worktree", name="close", repo="/r"),
+        group=group,
+        kind="dir",
+        vis_sessions=group["sessions"],
+    )
+    spans = core.row_spans(row, home="/h", now_ms=0)
+    assert (" [wt:close]", "worktree") in spans
+    assert (" [worktree gone]", "orphan") not in spans
+
+
+def test_row_spans_badges_and_session() -> None:
+    worktree = "/r/.claude/worktrees/a1"
+    # store == home: the transcript is stranded in the missing worktree, so
+    # resuming really does need it recreated.
+    stranded = _session(home=worktree, session_id="s1", store=worktree, ts=0)
+    group = _group(path="/r", sessions=[stranded])
+    row = core.DirRow(
+        busy=False,
+        busy_any=False,
         cls=core.Classification(kind="orphan-worktree", name="a1", repo="/r"),
         group=group,
         kind="dir",
         vis_sessions=group["sessions"],
     )
     spans = core.row_spans(row, home="/h", now_ms=0)
+    assert (" [wt:a1]", "worktree") in spans
     assert (" [worktree gone]", "orphan") in spans
     row["cls"] = core.Classification(kind="gone")
     spans = core.row_spans(row, home="/h", now_ms=0)
@@ -635,7 +770,7 @@ def test_row_spans_badges_and_session() -> None:
         group=group,
         kind="session",
         running=True,
-        session=_session(session_id="s1", ts=0),
+        session=_session(home="/r", session_id="s1", ts=0),
     )
     assert core.row_spans(session_row, home="/h", now_ms=0) == [
         ("    ", "text"),
@@ -655,6 +790,7 @@ def test_row_spans_dir() -> None:
     )
     row = core.DirRow(
         busy=True,
+        busy_any=True,
         cls=core.Classification(kind="live"),
         group=group,
         kind="dir",
@@ -676,6 +812,7 @@ def test_row_spans_prefers_title() -> None:
     )
     row = core.DirRow(
         busy=False,
+        busy_any=False,
         cls=core.Classification(kind="live"),
         group=group,
         kind="dir",
