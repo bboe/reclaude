@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-01
+
+### Fixed
+- Worktree sessions no longer vanish from the picker. `history.jsonl` records
+  the directory a prompt was typed in, which for a worktree session is always
+  the worktree — but the transcript lives under the directory `claude` was
+  *launched* from, which is the owning repository when the session was started
+  with `--worktree` or entered a worktree mid-session. Only the worktree
+  location was checked, so those sessions failed the transcript lookup and were
+  dropped silently, showing no row at all. Both locations are now tried, and
+  whichever holds the transcript drives the resume command and the session's
+  name.
+
+### Changed
+- Resuming a worktree session whose worktree is gone no longer destroys work.
+  `claude --worktree <name>` resets branch `worktree-<name>` to the base ref
+  whenever it has to *create* the worktree, orphaning any commits on it, and
+  restores only the conversation — the worktree comes back empty. The worktree
+  is now recreated from its surviving branch with `git worktree add`, so
+  committed work returns with the session and the branch is left untouched;
+  `--worktree` is passed only when the worktree already exists. When the branch
+  is gone as well, recreating empty is the only option and a `y/n` prompt says
+  so before anything is created.
+
 ## [0.4.0] - 2026-07-22
 
 ### Added
@@ -65,6 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On selection, `chdir`s into the chosen directory and execs
   `claude --resume <id>`.
 
+[0.5.0]: https://github.com/bboe/reclaude/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/bboe/reclaude/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/bboe/reclaude/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bboe/reclaude/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bboe/reclaude/compare/v0.1.0...v0.2.0
