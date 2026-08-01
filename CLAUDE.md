@@ -31,14 +31,17 @@ Data flow: `history.jsonl` → entries → groups (sessions attributed to their 
 
 ### Invariants worth protecting
 
-- **Display = action.** A dir row shows the time/prompt of `vis_sessions[0]` and Enter resumes exactly that session id. Never reintroduce `claude --continue` — it can disagree with what's displayed.
+- **Display = action.** A dir row shows the time/prompt of `vis_sessions[0]` and Enter resumes exactly that session id. Never reintroduce `claude --continue` — it can disagree with what's displayed. A dir row's path is the repo but its launch may land in a worktree, so the row carries that session's `[wt:<name>]` tag to keep the two in agreement.
 - **Re-attaching a live session is refused; a second session in a busy dir is confirmed.** Resuming a session whose id is in `running_ids` is hard-blocked (two processes on one transcript corrupts it). Resuming a *different* session in a busy dir stashes the `Launch` in `_PickerState.pending` and arms a y/n footer prompt — only `y` proceeds, accepting the shared-working-tree risk. The confirm key is handled in `run_picker` *before* the filter, so y/n there never feed the incremental filter. A worktree can't isolate a resume: transcripts are bound to the dir the session was launched from.
 - **One confirm mechanism.** A `Launch` carrying a `confirm` message arms the same `_PickerState.pending` prompt as a busy dir, and `_build_frame` shows that message in place of `FLASH_CONFIRM`. Never add a second, separate prompt path.
 - **Never let claude create a worktree.** `plan_launch` passes `--worktree <name>` only when that worktree already exists, because creating one resets branch `worktree-<name>` to the base ref and orphans its commits. A missing worktree is restored from its surviving branch via `Launch.setup` instead; only a missing branch takes the lossy path, and that one must be gated by `Launch.confirm`.
 - **`Launch.setup` is the only thing reclaude may run before exec** — a fixed argv built by `plan_launch`, never a shell string, and the only place reclaude modifies a repo.
 - **Filters before the MAX_DIRS cap** in `flatten_rows`, so hiding noise surfaces older live dirs.
+- **Worktree sessions nest under their repo.** `group_by_home` keys the group by the owning repo, and every session carries its own `home` — the dir history recorded. Anything derived from *where a session lives* (the resume command, `classify_dir`, the busy check, the `[wt:]` tag, path filtering) must read `session["home"]`, never `group["path"]`; one row routinely holds sessions homed in the repo and in several worktrees.
+- **`busy` gates, `busy_any` informs.** A dir row's `busy` is the launch target's (`vis_sessions[0]`) and decides the confirm prompt; `busy_any` covers every visible session so a live claude anywhere under the row still shows `[running]`. A worktree session's claude often registers its cwd as the *repo*, so per-session busy alone would miss it.
 - **Printable keys feed the incremental filter.** New shortcuts must be control keys (Ctrl-W=23 toggles missing dirs, Ctrl-T=20 cycles the age window); `q` quits only when the filter is empty.
 - `tui.COLOR_KEYS` must cover every key `core.row_spans` emits.
+- **Rendering stays cheap** — `row_spans` runs per visible row every keypress, so badges may only use what `classify_dir` already knows. The `[worktree gone]` badge is therefore store-based, never branch-based; the `git` branch check belongs in `plan_launch`, which runs once on Enter.
 - All screen writes go through `tui._addstr`, which clips to `maxx - 1` columns and tolerates `curses.error` (tiny terminals, bottom-right quirk).
 
 ## Empirically verified Claude Code facts (the whole design rests on these)

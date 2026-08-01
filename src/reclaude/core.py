@@ -64,6 +64,10 @@ class Classification:
 class DirRow(BaseRow):
     """A directory row produced by flatten_rows."""
 
+    # busy (from BaseRow) is the launch target's — it gates Enter. busy_any
+    # covers every visible session, so a live claude anywhere under the row
+    # still shows [running] even when Enter would resume elsewhere.
+    busy_any: bool
     vis_sessions: list[Session]
 
 
@@ -132,6 +136,7 @@ class Session(TypedDict):
     """One session's newest timestamp, prompt, and title ("" when untitled)."""
 
     display: str
+    home: str  # dir history recorded; the worktree for a worktree session
     session_id: str
     store: str  # dir whose munged projects dir actually holds the transcript
     title: str
@@ -265,6 +270,27 @@ def _looks_like_claude(name: str, /) -> bool:
     return name == "claude" or name.endswith("/claude") or "/claude/versions/" in name
 
 
+def _missing_badge(
+    *, classification: Classification, session: Session
+) -> tuple[str, str] | None:
+    """Badge a session whose directory is gone, when that blocks a clean resume.
+
+    A worktree session whose transcript lives in the repo resumes there with a
+    plain `--resume`, so a reaped worktree costs nothing and is not worth
+    flagging. Only a transcript stranded in a missing worktree needs that
+    worktree recreated, which is the case worth warning about.
+
+    Returns:
+        The (text, colorkey) badge span, or None when nothing is wrong.
+
+    """
+    if classification.kind == "gone":
+        return (" [gone]", "gone")
+    if classification.kind == "orphan-worktree" and session["store"] == session["home"]:
+        return (" [worktree gone]", "orphan")
+    return None
+
+
 def _process_cwd(*, pid: str, run: Callable[[list[str]], str]) -> str:
     """Return a process's working directory via lsof (used where /proc is absent).
 
@@ -323,6 +349,49 @@ def _scan_busy_dirs(*, run: Callable[[list[str]], str]) -> set[str]:
         if cwd:
             busy.add(cwd)
     return busy
+
+
+def _visible_sessions(*, criteria: RowFilter, group: Group) -> list[Session]:
+    """Select a group's sessions that pass the age, text, and missing filters.
+
+    Each session is judged against its own home, not the group's path, so a
+    worktree session nested under its repo still filters and hides by the
+    worktree it actually lives in.
+
+    Returns:
+        The visible sessions, newest first (the group's own order).
+
+    """
+    filter_lower = criteria.filter_text.lower()
+    visible = []
+    for session in group["sessions"]:
+        if criteria.min_ts is not None and session["ts"] < criteria.min_ts:
+            continue
+        path = abbreviate_path(session["home"], home=criteria.home).lower()
+        if not (
+            filter_lower in path
+            or filter_lower in session["display"].lower()
+            or filter_lower in session["title"].lower()
+        ):
+            continue
+        if (
+            not criteria.show_missing
+            and classify_dir(session["home"], isdir=criteria.isdir).kind != "live"
+        ):
+            continue
+        visible.append(session)
+    return visible
+
+
+def _worktree_name(session: Session, /) -> str | None:
+    """Return the worktree a session lives in, or None outside one.
+
+    Returns:
+        The worktree name parsed from the session's home, else None.
+
+    """
+    match = WORKTREE_RE.match(session["home"])
+    return match.group("name") if match else None
 
 
 def abbreviate_path(path: str, /, *, home: str) -> str:
@@ -412,41 +481,36 @@ def flatten_rows(
 ) -> list[DirRow | SessionRow]:
     """Flatten groups + expansion state into the visible row list.
 
-    A session is visible iff it passes the age window (criteria.min_ts) and
-    the text filter — a dir-path match admits all its sessions, otherwise the
-    prompt text must contain the filter (both case-insensitive). A dir is
-    shown iff it has visible sessions and passes the missing-dir filter; dirs
-    are capped at MAX_DIRS. Expanded dirs render only their visible sessions.
+    A session is visible iff it passes the age window (criteria.min_ts), the
+    text filter (its own path, prompt, or title, case-insensitively), and the
+    missing-dir filter — all judged against the session's own home, so a
+    worktree session filters by the worktree even though it renders under its
+    repo. A dir is shown iff it has visible sessions; dirs are capped at
+    MAX_DIRS. Expanded dirs render only their visible sessions.
+
+    Busy and classification are per session rather than per dir, because one
+    dir row can hold sessions homed in the repo and in several of its
+    worktrees. A dir row takes both from the session Enter would resume —
+    vis_sessions[0] — keeping display and action in agreement.
 
     Returns:
         The visible rows: each kept dir, immediately followed by its visible
         session rows when expanded.
 
     """
-    filter_lower = criteria.filter_text.lower()
     kept: list[DirRow] = []
     for group in groups:
-        abbreviated = abbreviate_path(group["path"], home=criteria.home)
-        path_match = filter_lower in abbreviated.lower()
-        visible = [
-            session
-            for session in group["sessions"]
-            if (criteria.min_ts is None or session["ts"] >= criteria.min_ts)
-            and (
-                path_match
-                or filter_lower in session["display"].lower()
-                or filter_lower in session["title"].lower()
-            )
-        ]
+        visible = _visible_sessions(criteria=criteria, group=group)
         if not visible:
-            continue
-        classification = classify_dir(group["path"], isdir=criteria.isdir)
-        if not criteria.show_missing and classification.kind != "live":
             continue
         kept.append(
             DirRow(
-                busy=os.path.realpath(group["path"]) in criteria.busy,
-                cls=classification,
+                busy=os.path.realpath(visible[0]["home"]) in criteria.busy,
+                busy_any=any(
+                    os.path.realpath(session["home"]) in criteria.busy
+                    for session in visible
+                ),
+                cls=classify_dir(visible[0]["home"], isdir=criteria.isdir),
                 group=group,
                 kind="dir",
                 vis_sessions=visible,
@@ -458,8 +522,8 @@ def flatten_rows(
         if dir_row["group"]["path"] in criteria.expanded:
             rows.extend(
                 SessionRow(
-                    busy=dir_row["busy"],
-                    cls=dir_row["cls"],
+                    busy=os.path.realpath(session["home"]) in criteria.busy,
+                    cls=classify_dir(session["home"], isdir=criteria.isdir),
                     group=dir_row["group"],
                     kind="session",
                     running=session["session_id"] in criteria.running_ids,
@@ -486,6 +550,11 @@ def group_by_home(
     depend on it. Sessions with no transcript in either location are dropped;
     the rest are titled via session_title ("" when untitled).
 
+    Worktree sessions are grouped under their owning repo rather than under
+    the worktree, so a repo and its worktrees are one row instead of several.
+    Each session keeps its own home, which is what the resume command, the
+    busy check, and the worktree tag are all derived from.
+
     Returns:
         Groups sorted newest-first, each with its sessions newest-first.
 
@@ -504,9 +573,12 @@ def group_by_home(
         store = transcript_home(home_dir=session["home"], session_id=session_id)
         if store is None:
             continue
-        dirs.setdefault(session["home"], []).append(
+        match = WORKTREE_RE.match(session["home"])
+        group_path = match.group("repo") if match else session["home"]
+        dirs.setdefault(group_path, []).append(
             Session(
                 display=session["display"],
+                home=session["home"],
                 session_id=session_id,
                 store=store,
                 # Titled from store, not home: the transcript is the only
@@ -689,9 +761,12 @@ def row_spans(
 ) -> list[tuple[str, str]]:
     """Render a flatten_rows row as (text, colorkey) spans.
 
-    Color keys: "gone", "orphan", "path", "running", "text", "time" — mapped
-    to curses attributes by tui.init_colors(); tui.COLOR_KEYS must cover
-    every key emitted here.
+    Color keys: "gone", "orphan", "path", "running", "text", "time",
+    "worktree" — mapped to curses attributes by tui.init_colors();
+    tui.COLOR_KEYS must cover every key emitted here.
+
+    A dir row is tagged with the worktree of the session Enter would resume,
+    since that row's path is the repo but the launch may land in a worktree.
 
     Returns:
         The row as a list of (text, colorkey) spans.
@@ -705,12 +780,17 @@ def row_spans(
             (f"{relative_time(now_ms=now_ms, ts_ms=newest_ts):>4}  ", "time"),
             (abbreviate_path(group["path"], home=home), "path"),
         ]
-        if row["busy"]:
+        if visible and (name := _worktree_name(visible[0])) is not None:
+            spans.append((f" [wt:{name}]", "worktree"))
+        if row["busy_any"]:
             spans.append((" [running]", "running"))
-        if row["cls"].kind == "orphan-worktree":
-            spans.append((" [worktree gone]", "orphan"))
-        elif row["cls"].kind == "gone":
-            spans.append((" [gone]", "gone"))
+        badge = (
+            _missing_badge(classification=row["cls"], session=visible[0])
+            if visible
+            else None
+        )
+        if badge is not None:
+            spans.append(badge)
         # The session title (when the transcript has one) labels the row
         # better than the last prompt; fall back to the prompt otherwise.
         last_display = (visible[0]["title"] or visible[0]["display"]) if visible else ""
@@ -721,10 +801,15 @@ def row_spans(
     spans = [
         ("    ", "text"),
         (f"{relative_time(now_ms=now_ms, ts_ms=session['ts']):>4}  ", "time"),
-        (session["title"] or session["display"] or "(no prompt)", "text"),
     ]
+    if (name := _worktree_name(session)) is not None:
+        spans.append((f"[wt:{name}] ", "worktree"))
+    spans.append((session["title"] or session["display"] or "(no prompt)", "text"))
     if row["running"]:
         spans.append((" [running]", "running"))
+    badge = _missing_badge(classification=row["cls"], session=session)
+    if badge is not None:
+        spans.append(badge)
     return spans
 
 
